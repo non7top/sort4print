@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["core", "app", "tools/pack-cities"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+    "bmp",
+] }
+kamadak-exif = "0.6"
+ab_glyph = "0.2"
+ttf-parser = "0.25"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
