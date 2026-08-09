@@ -98,6 +98,7 @@ fn this_picture(app: &mut Sort4Print, ui: &mut egui::Ui) {
     }
 
     // Overrides. Empty means "use the geocoded value".
+    let mut changed = false;
     let mut city = app.entries[index].city_override.clone().unwrap_or_default();
     let mut country = app.entries[index]
         .country_override
@@ -124,6 +125,7 @@ fn this_picture(app: &mut Sort4Print, ui: &mut egui::Ui) {
             .changed()
         {
             app.entries[index].city_override = (!city.trim().is_empty()).then(|| city.clone());
+            changed = true;
         }
     });
     ui.horizontal(|ui| {
@@ -138,19 +140,49 @@ fn this_picture(app: &mut Sort4Print, ui: &mut egui::Ui) {
         {
             app.entries[index].country_override =
                 (!country.trim().is_empty()).then(|| country.clone());
+            changed = true;
         }
     });
+
+    // The name of the spot itself, which no database can supply.
+    let mut description = app.entries[index].description.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Place");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut description)
+                    .hint_text("Chinatown, the old harbour, …")
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text("Use {description} in the caption text to print this")
+            .changed()
+        {
+            app.entries[index].description =
+                (!description.trim().is_empty()).then(|| description.trim().to_string());
+            changed = true;
+        }
+    });
+    if !app.config.caption.template.contains("{description}")
+        && app.entries[index].description.is_some()
+    {
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 180, 90),
+            "The caption text has no {description} in it, so this will not print.",
+        );
+    }
 
     nearby_places(app, ui, index, gps);
 
     ui.horizontal(|ui| {
-        if ui.small_button("Clear override").clicked() {
+        if ui.small_button("Clear").clicked() {
             app.entries[index].city_override = None;
             app.entries[index].country_override = None;
+            app.entries[index].description = None;
+            changed = true;
         }
         if ui
             .small_button("Apply to all")
-            .on_hover_text("Give every photo in the folder this place")
+            .on_hover_text("Give every photo in the folder this city and country")
             .clicked()
         {
             let (c, k) = (
@@ -161,8 +193,15 @@ fn this_picture(app: &mut Sort4Print, ui: &mut egui::Ui) {
                 entry.city_override = c.clone();
                 entry.country_override = k.clone();
             }
+            // Descriptions are deliberately left alone: "Chinatown" is about
+            // one picture, not about the folder.
+            app.notes_changed_everywhere();
         }
     });
+
+    if changed {
+        app.note_changed(index);
+    }
 
     let caption = app.caption_for(index, image.as_deref());
     ui.horizontal_wrapped(|ui| {
@@ -232,7 +271,7 @@ fn caption_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
         )
         .changed();
     ui.label(
-        egui::RichText::new("{city} {country} {place} {date} {filename}")
+        egui::RichText::new("{city} {country} {place} {description} {date} {filename}")
             .small()
             .weak(),
     );

@@ -19,13 +19,24 @@ pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
             ui.separator();
 
             let total = app.entries.len();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, ROW_HEIGHT, total, |ui, range| {
-                    for index in range {
-                        row(app, ui, index);
-                    }
-                });
+            let viewport = ui.available_height();
+
+            // Rows are a fixed height, so the offset that centres one can be
+            // computed outright. That matters because `show_rows` never builds
+            // the rows outside the viewport, so there would otherwise be no
+            // widget to scroll to when the jump is a long one.
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if std::mem::take(&mut app.scroll_to_current) {
+                let centred = app.current as f32 * ROW_HEIGHT - (viewport - ROW_HEIGHT) / 2.0;
+                let furthest = (total as f32 * ROW_HEIGHT - viewport).max(0.0);
+                scroll = scroll.vertical_scroll_offset(centred.clamp(0.0, furthest));
+            }
+
+            scroll.show_rows(ui, ROW_HEIGHT, total, |ui, range| {
+                for index in range {
+                    row(app, ui, index);
+                }
+            });
         });
 }
 

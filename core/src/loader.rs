@@ -107,11 +107,28 @@ pub fn load_full(path: &Path) -> Result<(RgbaImage, PhotoMeta)> {
     Ok((image.into_rgba8(), meta))
 }
 
+/// Ceiling on what one decode may allocate.
+///
+/// The `image` crate's default cap is generous for a web service and much too
+/// small for a modern phone: a 50-megapixel photo needs 200 MB as RGBA before
+/// anything else, and the decode simply failed with "Memory limit exceeded".
+/// This is raised to cover any real camera — 2 GiB is over 500 megapixels —
+/// while still refusing a corrupt header that claims an absurd size, which
+/// would otherwise abort the process on a failed allocation rather than
+/// reporting a bad file.
+const MAX_DECODE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 fn decode(path: &Path) -> Result<DynamicImage> {
-    image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?
         .with_guessed_format()
-        .with_context(|| format!("identifying {}", path.display()))?
+        .with_context(|| format!("identifying {}", path.display()))?;
+
+    let mut limits = image::Limits::no_limits();
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+
+    reader
         .decode()
         .with_context(|| format!("decoding {}", path.display()))
 }

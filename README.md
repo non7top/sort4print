@@ -12,18 +12,40 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
   either every photo or only the ones you ticked.
 - **Crop.** The cut-out window starts as the largest centred window of your
   print proportion that fits the photo. Drag to move it, drag a handle to
-  resize it — the proportions stay locked — and scroll to zoom. The window is
-  allowed to reach past the edge of the photo; whatever falls outside prints as
-  the border colour.
-- **Caption.** City, country and date in a corner, from EXIF. The city comes
-  from the GPS fix matched against a city database built into the exe, so it
-  works with no network; you can override it per photo or for the whole folder.
+  resize it — the proportions stay locked — and scroll to zoom. Edges and the
+  centre lines are magnetic, so a flush edge or an exact fit lands by hand.
+  The window may reach past the photo, and whatever falls outside prints as the
+  border colour; it will not grow past the point where the photo fits inside it
+  entirely, since past there every extra pixel is border and none is picture.
+  The window turns green once the photo is picked.
+- **Caption.** City, country, your own name for the spot, and the date, in a
+  corner. City and country come from the GPS fix matched against a database
+  built into the exe, so it works with no network; both can be overridden per
+  photo or for the whole folder.
+- **Notes stay put.** Ticks, crop windows, place overrides and descriptions are
+  written to `sort4print-notes.ini` in the folder of photos, so closing the
+  program half way through a holiday does not throw the work away. Deleting
+  that file discards those choices and nothing else.
 - **Export.** The crop is taken from the original at full resolution and never
   resampled, written as JPEG at quality 100 into a folder you choose.
 
 Everything is decoded on background threads: the photos on either side of the
 one you are looking at are already loaded, rotated, measured and geocoded before
 you get to them.
+
+## Keyboard and mouse
+
+| | |
+|---|---|
+| `←` `→` | previous / next photo |
+| `Space` | pick or unpick this photo |
+| `Enter` | export everything picked |
+| `Alt`+arrows | nudge the crop window (hold `Shift` for bigger steps) |
+| drag | move the crop window |
+| drag a handle | resize it, proportions locked |
+| scroll | zoom the crop window |
+| `Ctrl`+scroll | zoom the view, to look closely — changes nothing exported |
+| middle-drag | pan the view |
 
 ## Building
 

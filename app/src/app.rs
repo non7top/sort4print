@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use ab_glyph::FontVec;
 use sort4print_core::config::{Config, NavMode};
-use sort4print_core::cropbox::{CropBox, Handle};
+use sort4print_core::cropbox::{Constraints, CropBox, Handle};
 use sort4print_core::export;
 use sort4print_core::fonts::FontCatalog;
 use sort4print_core::loader;
+use sort4print_core::sidecar::{PhotoState, Sidecar};
 
 use crate::prefetch::{JobKind, LoadedImage, Prefetcher};
 
@@ -28,6 +29,9 @@ pub struct Entry {
     /// is not the name you want on the print.
     pub city_override: Option<String>,
     pub country_override: Option<String>,
+    /// What you call this particular spot — "Chinatown". Stays with the photo,
+    /// including across restarts via the folder's notes file.
+    pub description: Option<String>,
     pub exported: bool,
 }
 
@@ -39,8 +43,27 @@ impl Entry {
             crop: None,
             city_override: None,
             country_override: None,
+            description: None,
             exported: false,
         }
+    }
+
+    fn to_state(&self) -> PhotoState {
+        PhotoState {
+            selected: self.selected,
+            crop: self.crop,
+            city: self.city_override.clone(),
+            country: self.country_override.clone(),
+            description: self.description.clone(),
+        }
+    }
+
+    fn apply_state(&mut self, state: &PhotoState) {
+        self.selected = state.selected;
+        self.crop = state.crop;
+        self.city_override = state.city.clone();
+        self.country_override = state.country.clone();
+        self.description = state.description.clone();
     }
 
     pub fn file_name(&self) -> String {
@@ -56,6 +79,23 @@ impl Entry {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
     }
+}
+
+/// A frame's worth of keyboard state, read once so the input lock is taken
+/// once rather than a dozen times.
+struct Keys {
+    alt: bool,
+    shift: bool,
+    right: bool,
+    left: bool,
+    up: bool,
+    down: bool,
+    page_down: bool,
+    page_up: bool,
+    d: bool,
+    a: bool,
+    space: bool,
+    enter: bool,
 }
 
 pub struct DragState {
@@ -88,6 +128,7 @@ struct ExportJob {
     crop: Option<CropBox>,
     city_override: Option<String>,
     country_override: Option<String>,
+    description: Option<String>,
 }
 
 pub struct ExportRun {
@@ -112,6 +153,10 @@ pub struct Sort4Print {
 
     pub prefetch: Prefetcher,
     textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Upload order, so the oldest texture can be dropped when the cache fills.
+    texture_order: std::collections::VecDeque<PathBuf>,
+    /// Thumbnails are tiny and there are never many on screen, so these are
+    /// simply kept.
     thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
     /// Rendered caption swatch for the settings panel, keyed by the settings it
     /// was rendered from so it is only rebuilt when something changes.
@@ -124,12 +169,23 @@ pub struct Sort4Print {
     pub font_filter: String,
 
     pub drag: Option<DragState>,
+    /// View magnification, 1.0 being "everything fits". Ctrl+scroll changes it;
+    /// it is about looking closely, and has nothing to do with the crop.
+    pub view_zoom: f32,
+    /// View offset in screen pixels, for panning once zoomed in.
+    pub view_pan: egui::Vec2,
+    /// Set when something other than a click moved the selection, so the
+    /// filmstrip knows to bring the new row into view.
+    pub scroll_to_current: bool,
     pub show_settings: bool,
     pub settings_tab: SettingsTab,
     pub status: String,
     pub export_run: Option<ExportRun>,
     /// Free-text city search box in the location panel.
     pub place_search: String,
+    /// Per-photo choices for the open folder, mirrored to a notes file there.
+    notes: Sidecar,
+    notes_dirty: bool,
 }
 
 impl Sort4Print {
@@ -167,12 +223,18 @@ impl Sort4Print {
             caption_font_key: (String::new(), String::new()),
             prefetch,
             textures: HashMap::new(),
+            texture_order: std::collections::VecDeque::new(),
             thumb_textures: HashMap::new(),
             caption_swatch: None,
             caption_overlay: None,
             ratio_input: config_ratio_text,
             font_filter: String::new(),
             drag: None,
+            view_zoom: 1.0,
+            view_pan: egui::Vec2::ZERO,
+            scroll_to_current: false,
+            notes: Sidecar::default(),
+            notes_dirty: false,
             show_settings: true,
             settings_tab: SettingsTab::Caption,
             status: String::new(),
@@ -194,22 +256,86 @@ impl Sort4Print {
     // ---- folder and selection -------------------------------------------
 
     pub fn open_folder(&mut self, dir: &Path) {
+        // Whatever was decided about the folder being left behind.
+        self.save_notes();
+
         match loader::scan_folder(dir) {
             Ok(files) => {
-                self.entries = files.into_iter().map(Entry::new).collect();
+                let notes = Sidecar::load(dir);
+                let restored = notes.len();
+
+                self.entries = files
+                    .into_iter()
+                    .map(|path| {
+                        let mut entry = Entry::new(path);
+                        if let Some(state) = notes.get(&entry.file_name()) {
+                            entry.apply_state(state);
+                        }
+                        entry
+                    })
+                    .collect();
+                self.notes = notes;
+                self.notes_dirty = false;
                 self.current = 0;
+                self.reset_view();
                 self.clear_image_caches();
                 self.config.source_dir = Some(dir.to_path_buf());
                 self.config_dirty = true;
                 self.status = format!(
-                    "{} — {} picture{}",
+                    "{} — {} picture{}{}",
                     dir.display(),
                     self.entries.len(),
-                    if self.entries.len() == 1 { "" } else { "s" }
+                    if self.entries.len() == 1 { "" } else { "s" },
+                    if restored > 0 {
+                        format!(", {restored} with notes from last time")
+                    } else {
+                        String::new()
+                    }
                 );
             }
             Err(e) => self.status = format!("Could not open folder: {e:#}"),
         }
+    }
+
+    /// Records that the per-photo state changed, so it gets written out.
+    /// Cheap to call from anywhere a control is touched.
+    pub fn note_changed(&mut self, index: usize) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        let name = entry.file_name();
+        let state = entry.to_state();
+        self.notes.set(&name, state);
+        self.notes_dirty = true;
+    }
+
+    /// Re-reads every entry into the notes. Used after bulk operations, where
+    /// tracking each change individually would be more code than it is worth.
+    pub fn notes_changed_everywhere(&mut self) {
+        for index in 0..self.entries.len() {
+            self.note_changed(index);
+        }
+    }
+
+    pub fn save_notes(&mut self) {
+        if !self.notes_dirty {
+            return;
+        }
+        let Some(dir) = self.config.source_dir.clone() else {
+            return;
+        };
+        match self.notes.save(&dir) {
+            Ok(()) => self.notes_dirty = false,
+            Err(e) => {
+                crate::diagnostics::log(&format!("could not write the notes file: {e:#}"));
+                self.status = format!("Could not save notes: {e:#}");
+            }
+        }
+    }
+
+    pub fn reset_view(&mut self) {
+        self.view_zoom = 1.0;
+        self.view_pan = egui::Vec2::ZERO;
     }
 
     pub fn selected_count(&self) -> usize {
@@ -228,6 +354,11 @@ impl Sort4Print {
         if let Some(entry) = self.entries.get_mut(self.current) {
             entry.selected = !entry.selected;
         }
+        self.note_changed(self.current);
+    }
+
+    pub fn current_is_selected(&self) -> bool {
+        self.current_entry().map(|e| e.selected).unwrap_or(false)
     }
 
     /// Steps through the folder, honouring the All / Only selected switch.
@@ -250,14 +381,20 @@ impl Sort4Print {
             }
             if !restrict || self.entries[index as usize].selected {
                 self.current = index as usize;
+                // A close-up of one photo says nothing about the next.
+                self.reset_view();
+                // The list has to follow, or the picture being edited scrolls
+                // out of sight after a few steps.
+                self.scroll_to_current = true;
                 return;
             }
         }
     }
 
     pub fn go_to(&mut self, index: usize) {
-        if index < self.entries.len() {
+        if index < self.entries.len() && index != self.current {
             self.current = index;
+            self.reset_view();
         }
     }
 
@@ -316,10 +453,19 @@ impl Sort4Print {
         }
         let handle = upload(ctx, &path.to_string_lossy(), &image.preview.rgba);
         self.textures.insert(path.to_path_buf(), handle.clone());
-        // Textures are cheap to rebuild and expensive to hoard; keep roughly as
-        // many as the decode cache holds.
-        if self.textures.len() > self.config.prefetch.cache * 2 {
-            self.textures.clear();
+        self.texture_order.push_back(path.to_path_buf());
+
+        // Evict one at a time, oldest first. Emptying the whole map when it
+        // filled up meant every visible photo had to be re-uploaded at once,
+        // which is a stall you can feel; dropping the least recent costs
+        // nothing noticeable.
+        let limit = self.config.prefetch.cache.max(4);
+        while self.texture_order.len() > limit {
+            if let Some(oldest) = self.texture_order.pop_front() {
+                if oldest != path {
+                    self.textures.remove(&oldest);
+                }
+            }
         }
         handle
     }
@@ -344,6 +490,7 @@ impl Sort4Print {
     pub fn clear_image_caches(&mut self) {
         self.prefetch.clear();
         self.textures.clear();
+        self.texture_order.clear();
         self.thumb_textures.clear();
         self.caption_overlay = None;
     }
@@ -370,9 +517,29 @@ impl Sort4Print {
         })
     }
 
+    /// The photo's edges and how strongly the window sticks to them. The snap
+    /// distance is given in image pixels but chosen in screen pixels, so it
+    /// feels the same however far the view is zoomed in.
+    pub fn constraints_for(&self, image_w: u32, image_h: u32, screen_per_image: f64) -> Constraints {
+        const SNAP_SCREEN_PX: f64 = 9.0;
+        let snap = if screen_per_image > 0.0 {
+            SNAP_SCREEN_PX / screen_per_image
+        } else {
+            0.0
+        };
+        Constraints::new(image_w as f64, image_h as f64, snap)
+    }
+
     pub fn set_crop(&mut self, index: usize, crop: CropBox) {
-        if let Some(entry) = self.entries.get_mut(index) {
-            entry.crop = Some(crop);
+        let changed = match self.entries.get_mut(index) {
+            Some(entry) if entry.crop != Some(crop) => {
+                entry.crop = Some(crop);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.note_changed(index);
         }
     }
 
@@ -380,6 +547,7 @@ impl Sort4Print {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.crop = None;
         }
+        self.note_changed(index);
     }
 
     /// Re-proportions every crop already made. Called when the print size
@@ -437,6 +605,7 @@ impl Sort4Print {
             image.and_then(|i| i.place.as_ref()),
             entry.city_override.as_deref(),
             entry.country_override.as_deref(),
+            entry.description.as_deref(),
             &entry.stem(),
         )
     }
@@ -472,6 +641,7 @@ impl Sort4Print {
                 crop: e.crop,
                 city_override: e.city_override.clone(),
                 country_override: e.country_override.clone(),
+                description: e.description.clone(),
             })
             .collect();
 
@@ -499,6 +669,7 @@ impl Sort4Print {
                         crop,
                         city_override,
                         country_override,
+                        description,
                     } = job;
                     let result = (|| -> anyhow::Result<()> {
                         let crop = match crop {
@@ -528,6 +699,7 @@ impl Sort4Print {
                             place.as_ref(),
                             city_override.as_deref(),
                             country_override.as_deref(),
+                            description.as_deref(),
                             &stem,
                         );
                         export::export(
@@ -555,6 +727,10 @@ impl Sort4Print {
                 let _ = tx.send(ExportMsg::Finished);
             })
             .ok();
+
+        // The notes describe exactly what is being exported; get them on disk
+        // before a long job starts rather than after it.
+        self.save_notes();
 
         self.export_run = Some(ExportRun {
             rx,
@@ -624,31 +800,65 @@ impl Sort4Print {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (next, prev, toggle, export_now) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowRight)
-                    || i.key_pressed(egui::Key::PageDown)
-                    || i.key_pressed(egui::Key::D),
-                i.key_pressed(egui::Key::ArrowLeft)
-                    || i.key_pressed(egui::Key::PageUp)
-                    || i.key_pressed(egui::Key::A),
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::Enter),
-            )
+        let keys = ctx.input(|i| Keys {
+            alt: i.modifiers.alt,
+            shift: i.modifiers.shift,
+            right: i.key_pressed(egui::Key::ArrowRight),
+            left: i.key_pressed(egui::Key::ArrowLeft),
+            up: i.key_pressed(egui::Key::ArrowUp),
+            down: i.key_pressed(egui::Key::ArrowDown),
+            page_down: i.key_pressed(egui::Key::PageDown),
+            page_up: i.key_pressed(egui::Key::PageUp),
+            d: i.key_pressed(egui::Key::D),
+            a: i.key_pressed(egui::Key::A),
+            space: i.key_pressed(egui::Key::Space),
+            enter: i.key_pressed(egui::Key::Enter),
         });
 
-        if next {
+        // Alt turns the arrows into a nudge of the crop window rather than a
+        // step through the folder — the two gestures are close enough in intent
+        // that sharing the keys reads naturally, and far enough apart that they
+        // must not be confused.
+        if keys.alt && (keys.left || keys.right || keys.up || keys.down) {
+            let step = if keys.shift { 40.0 } else { 8.0 };
+            let dx = f64::from(i32::from(keys.right) - i32::from(keys.left)) * step;
+            let dy = f64::from(i32::from(keys.down) - i32::from(keys.up)) * step;
+            self.nudge_crop(dx, dy);
+            return;
+        }
+
+        if keys.right || keys.page_down || keys.d {
             self.step(1);
         }
-        if prev {
+        if keys.left || keys.page_up || keys.a {
             self.step(-1);
         }
-        if toggle {
+        if keys.space {
             self.toggle_current();
         }
-        if export_now && self.can_export() {
+        if keys.enter && self.can_export() {
             self.start_export();
         }
+    }
+
+    /// Moves the crop window by whole image pixels, with the same sticking and
+    /// bounds a drag would get.
+    pub fn nudge_crop(&mut self, dx: f64, dy: f64) {
+        let index = self.current;
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        // Only a photo already measured can be nudged; anything else has no
+        // crop yet and no dimensions to constrain one with.
+        let path = entry.path.clone();
+        let Some(image) = self.prefetch.preview(&path) else {
+            return;
+        };
+        let (w, h) = (image.preview.full_w, image.preview.full_h);
+        let crop = self.crop_for(index, w, h);
+        // Nudges are in image pixels, so the snap distance is too.
+        let constraints = Constraints::new(w as f64, h as f64, 6.0);
+        self.set_crop(index, crop.apply_move(dx, dy, constraints));
     }
 
     pub fn save_config(&mut self) {
@@ -688,6 +898,12 @@ impl eframe::App for Sort4Print {
         }
         crate::ui::editor::show(self, ui);
 
+        // Write the notes once a gesture has finished, rather than on every
+        // frame of a drag, so a crop drag is one write and not a hundred.
+        if self.drag.is_none() {
+            self.save_notes();
+        }
+
         // An export in flight repaints so its progress moves; otherwise the
         // window sleeps until something happens.
         if self.export_run.as_ref().map(|r| r.running).unwrap_or(false) {
@@ -697,6 +913,7 @@ impl eframe::App for Sort4Print {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_config();
+        self.save_notes();
     }
 }
 

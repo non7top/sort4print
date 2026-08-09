@@ -41,6 +41,81 @@ impl Handle {
 /// handles become impossible to grab and the export is pointless anyway.
 pub const MIN_SIZE: f64 = 16.0;
 
+/// The photo the window is being framed against, and how eagerly the window
+/// sticks to it.
+///
+/// Two rules come out of this, both of them about not letting the window drift
+/// somewhere useless:
+///
+/// * It may not grow past the *cover* size — the smallest window of the chosen
+///   proportion that still contains the whole photo. Beyond that the window is
+///   bigger than the picture in both directions at once, so every extra pixel
+///   is border and none of it is photograph.
+/// * Its centre stays inside the photo, so it can be pushed well off to one
+///   side for a deliberate margin but cannot be dragged off into nothing.
+///
+/// Within those, edges and the two natural sizes are magnetic: come within
+/// `snap` of them and the window lands exactly on them, which is what makes a
+/// flush edge or an exact fit reachable by hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Constraints {
+    pub image_w: f64,
+    pub image_h: f64,
+    /// Snap distance in image pixels. Zero switches snapping off.
+    pub snap: f64,
+}
+
+impl Constraints {
+    pub fn new(image_w: f64, image_h: f64, snap: f64) -> Constraints {
+        Constraints {
+            image_w: image_w.max(1.0),
+            image_h: image_h.max(1.0),
+            snap: snap.max(0.0),
+        }
+    }
+
+    /// Largest window worth having: the whole photo just fits inside it.
+    pub fn cover_size(&self, ratio: f64) -> (f64, f64) {
+        let ratio = sane_ratio(ratio);
+        if self.image_w / self.image_h > ratio {
+            (self.image_w, self.image_w / ratio)
+        } else {
+            (self.image_h * ratio, self.image_h)
+        }
+    }
+
+    /// The starting size: the window just fits inside the photo.
+    pub fn contain_size(&self, ratio: f64) -> (f64, f64) {
+        let b = CropBox::fit_centered(self.image_w, self.image_h, ratio);
+        (b.w, b.h)
+    }
+}
+
+fn sane_ratio(ratio: f64) -> f64 {
+    if ratio.is_finite() && ratio > 0.0 {
+        ratio
+    } else {
+        1.0
+    }
+}
+
+/// Which point of the box a gesture holds still, as a fraction of its size.
+/// Dragging the bottom-right corner pins the top-left, and so on; moving pins
+/// the centre.
+fn anchor_fraction(handle: Handle) -> (f64, f64) {
+    match handle {
+        Handle::TopLeft => (1.0, 1.0),
+        Handle::Top => (0.5, 1.0),
+        Handle::TopRight => (0.0, 1.0),
+        Handle::Right => (0.0, 0.5),
+        Handle::BottomRight => (0.0, 0.0),
+        Handle::Bottom => (0.5, 0.0),
+        Handle::BottomLeft => (1.0, 0.0),
+        Handle::Left => (1.0, 0.5),
+        Handle::Move => (0.5, 0.5),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CropBox {
     pub x: f64,
@@ -284,6 +359,108 @@ impl CropBox {
         self.contains(px, py).then_some(Handle::Move)
     }
 
+    /// Resizes to `new_w`, holding `ratio`, keeping the point at the given
+    /// fraction of the box fixed.
+    pub fn resized_to(&self, new_w: f64, ratio: f64, anchor: (f64, f64)) -> CropBox {
+        let ratio = sane_ratio(ratio);
+        let w = new_w.max(MIN_SIZE);
+        let h = (w / ratio).max(MIN_SIZE);
+        // Recover the width if the height was the binding minimum, so the
+        // proportion survives even at the very bottom of the range.
+        let w = h * ratio;
+        CropBox {
+            x: self.x + (self.w - w) * anchor.0,
+            y: self.y + (self.h - h) * anchor.1,
+            w,
+            h,
+        }
+    }
+
+    /// Nudges each axis onto the image edge or the centre line when it is
+    /// already close, so a flush edge is reachable by hand.
+    pub fn snap_position(&self, c: Constraints) -> CropBox {
+        if c.snap <= 0.0 {
+            return *self;
+        }
+        let snap_axis = |pos: f64, size: f64, extent: f64| -> f64 {
+            [0.0, extent - size, (extent - size) / 2.0]
+                .into_iter()
+                .filter(|candidate| (candidate - pos).abs() <= c.snap)
+                .min_by(|a, b| (a - pos).abs().total_cmp(&(b - pos).abs()))
+                .unwrap_or(pos)
+        };
+        CropBox {
+            x: snap_axis(self.x, self.w, c.image_w),
+            y: snap_axis(self.y, self.h, c.image_h),
+            ..*self
+        }
+    }
+
+    /// Keeps the centre of the window inside the photo.
+    pub fn clamp_position(&self, c: Constraints) -> CropBox {
+        let (cx, cy) = self.center();
+        let clamped_x = cx.clamp(0.0, c.image_w);
+        let clamped_y = cy.clamp(0.0, c.image_h);
+        CropBox {
+            x: self.x + (clamped_x - cx),
+            y: self.y + (clamped_y - cy),
+            ..*self
+        }
+    }
+
+    /// A drag of the whole window: move, stick to edges, stay on the photo.
+    pub fn apply_move(&self, dx: f64, dy: f64, c: Constraints) -> CropBox {
+        self.translated(dx, dy).snap_position(c).clamp_position(c)
+    }
+
+    /// A drag of one handle: resize on the locked proportion, refusing to grow
+    /// past the cover size and sticking to the sizes that line up with the
+    /// photo's edges.
+    pub fn apply_drag(
+        &self,
+        handle: Handle,
+        pointer: (f64, f64),
+        ratio: f64,
+        c: Constraints,
+    ) -> CropBox {
+        if handle == Handle::Move {
+            return *self;
+        }
+        let ratio = sane_ratio(ratio);
+        let raw = self.dragged(handle, pointer, ratio);
+        let (cover_w, _) = c.cover_size(ratio);
+        let anchor = anchor_fraction(handle);
+
+        let mut width = raw.w.clamp(MIN_SIZE, cover_w.max(MIN_SIZE));
+        if let Some(snapped) = nearest_within(width, &size_candidates(&raw, handle, ratio, c), c.snap)
+        {
+            width = snapped.clamp(MIN_SIZE, cover_w.max(MIN_SIZE));
+        }
+
+        raw.resized_to(width, ratio, anchor).clamp_position(c)
+    }
+
+    /// The scroll wheel: zoom about the centre, within the same limits.
+    pub fn apply_zoom(&self, factor: f64, ratio: f64, c: Constraints) -> CropBox {
+        let ratio = sane_ratio(ratio);
+        let factor = if factor.is_finite() && factor > 0.0 {
+            factor
+        } else {
+            1.0
+        };
+        let (cover_w, _) = c.cover_size(ratio);
+        let (contain_w, _) = c.contain_size(ratio);
+
+        let mut width = (self.w * factor).clamp(MIN_SIZE, cover_w.max(MIN_SIZE));
+        if let Some(snapped) = nearest_within(width, &[contain_w, cover_w], c.snap) {
+            width = snapped.clamp(MIN_SIZE, cover_w.max(MIN_SIZE));
+        }
+
+        self.resized_to(width, ratio, (0.5, 0.5))
+            .snap_position(c)
+            .clamp_position(c)
+    }
+
     /// Rounded to whole pixels for the actual export. Width and height are
     /// rounded first so the printed proportions survive the rounding.
     pub fn to_pixel_rect(&self) -> (i64, i64, u32, u32) {
@@ -291,6 +468,42 @@ impl CropBox {
         let h = self.h.round().max(1.0) as u32;
         (self.x.round() as i64, self.y.round() as i64, w, h)
     }
+}
+
+/// Widths the drag should stick to: the two natural sizes, plus whichever
+/// width puts the free edge exactly on the photo's edge.
+fn size_candidates(b: &CropBox, handle: Handle, ratio: f64, c: Constraints) -> Vec<f64> {
+    let (contain_w, _) = c.contain_size(ratio);
+    let (cover_w, _) = c.cover_size(ratio);
+    let mut out = vec![contain_w, cover_w];
+
+    let (ax, ay) = anchor_fraction(handle);
+    // A fraction of 0 means that edge is pinned and the far one is free.
+    if ax == 0.0 {
+        out.push(c.image_w - b.x);
+    } else if ax == 1.0 {
+        out.push(b.right());
+    }
+    if ay == 0.0 {
+        out.push((c.image_h - b.y) * ratio);
+    } else if ay == 1.0 {
+        out.push(b.bottom() * ratio);
+    }
+
+    out.retain(|w| w.is_finite() && *w >= MIN_SIZE);
+    out
+}
+
+/// The closest candidate to `value`, if any is within `tolerance`.
+fn nearest_within(value: f64, candidates: &[f64], tolerance: f64) -> Option<f64> {
+    if tolerance <= 0.0 {
+        return None;
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| (candidate - value).abs() <= tolerance)
+        .min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
 }
 
 fn default_sign_x(h: Handle) -> f64 {
@@ -444,6 +657,193 @@ mod tests {
         assert!(b.w > 0.0 && b.h > 0.0);
         let b = CropBox::fit_centered(1000.0, 800.0, f64::NAN);
         assert!(b.w.is_finite() && b.h.is_finite());
+    }
+
+    // ---- constrained gestures -------------------------------------------
+
+    /// 4000x3000 photo, 10x15 portrait window (ratio 2/3), 20 px of magnetism.
+    fn constraints() -> Constraints {
+        Constraints::new(4000.0, 3000.0, 20.0)
+    }
+
+    const PORTRAIT: f64 = 2.0 / 3.0;
+
+    #[test]
+    fn cover_is_the_smallest_window_containing_the_whole_photo() {
+        let c = constraints();
+        let (w, h) = c.cover_size(PORTRAIT);
+        assert!((w - 4000.0).abs() < EPS);
+        assert!((h - 6000.0).abs() < EPS);
+        assert!(w >= c.image_w && h >= c.image_h, "must cover the photo");
+
+        // Landscape target on the same photo binds on the other axis.
+        let (w, h) = c.cover_size(1.5);
+        assert!((w - 4500.0).abs() < EPS);
+        assert!((h - 3000.0).abs() < EPS);
+    }
+
+    #[test]
+    fn the_window_cannot_grow_past_the_photo_in_both_directions() {
+        let c = constraints();
+        let start = CropBox::fit_centered(4000.0, 3000.0, PORTRAIT);
+        // Haul the bottom-right handle far beyond everything.
+        let out = start.apply_drag(Handle::BottomRight, (99_000.0, 99_000.0), PORTRAIT, c);
+
+        let (cover_w, cover_h) = c.cover_size(PORTRAIT);
+        assert!(out.w <= cover_w + EPS, "{} > {cover_w}", out.w);
+        assert!(out.h <= cover_h + EPS, "{} > {cover_h}", out.h);
+        assert_ratio(out, PORTRAIT);
+        // At the limit one dimension still matches the photo exactly, so there
+        // is never a border on all four sides at once.
+        assert!(
+            out.w <= c.image_w + EPS || out.h <= c.image_h + EPS,
+            "border on every side: {out:?}"
+        );
+    }
+
+    #[test]
+    fn zooming_out_stops_at_the_cover_size() {
+        let c = constraints();
+        let start = CropBox::fit_centered(4000.0, 3000.0, PORTRAIT);
+        let mut b = start;
+        for _ in 0..50 {
+            b = b.apply_zoom(1.3, PORTRAIT, c);
+        }
+        let (cover_w, _) = c.cover_size(PORTRAIT);
+        assert!((b.w - cover_w).abs() < EPS, "settled at {} not {cover_w}", b.w);
+        assert_ratio(b, PORTRAIT);
+    }
+
+    #[test]
+    fn zooming_in_stops_at_the_minimum() {
+        let c = constraints();
+        let mut b = CropBox::fit_centered(4000.0, 3000.0, PORTRAIT);
+        for _ in 0..200 {
+            b = b.apply_zoom(0.7, PORTRAIT, c);
+        }
+        assert!(b.w >= MIN_SIZE - EPS && b.h >= MIN_SIZE - EPS, "{b:?}");
+        assert_ratio(b, PORTRAIT);
+    }
+
+    #[test]
+    fn moving_sticks_to_the_left_edge() {
+        let c = constraints();
+        let start = CropBox::new(12.0, 400.0, 2000.0, 3000.0);
+        // A move that would leave x at 3 lands it exactly on 0.
+        let out = start.apply_move(-9.0, 0.0, c);
+        assert!(out.x.abs() < EPS, "x = {}", out.x);
+        assert!((out.w - 2000.0).abs() < EPS, "size must not change");
+    }
+
+    #[test]
+    fn moving_sticks_to_the_right_edge_and_the_centre_line() {
+        let c = constraints();
+        let start = CropBox::new(1985.0, 0.0, 2000.0, 3000.0);
+        let out = start.apply_move(5.0, 0.0, c);
+        assert!((out.right() - 4000.0).abs() < EPS, "right = {}", out.right());
+
+        let centred = CropBox::new(990.0, 0.0, 2000.0, 3000.0);
+        let out = centred.apply_move(5.0, 0.0, c);
+        assert!((out.x - 1000.0).abs() < EPS, "x = {}", out.x);
+    }
+
+    #[test]
+    fn a_move_well_clear_of_an_edge_is_left_alone() {
+        let c = constraints();
+        let start = CropBox::new(1000.0, 0.0, 2000.0, 3000.0);
+        let out = start.apply_move(-300.0, 0.0, c);
+        assert!((out.x - 700.0).abs() < EPS, "x = {}", out.x);
+    }
+
+    #[test]
+    fn snapping_can_be_switched_off() {
+        let loose = Constraints::new(4000.0, 3000.0, 0.0);
+        let start = CropBox::new(12.0, 400.0, 2000.0, 3000.0);
+        let out = start.apply_move(-9.0, 0.0, loose);
+        assert!((out.x - 3.0).abs() < EPS, "x = {}", out.x);
+    }
+
+    #[test]
+    fn the_window_cannot_be_dragged_off_the_photo() {
+        let c = constraints();
+        let start = CropBox::fit_centered(4000.0, 3000.0, PORTRAIT);
+        let out = start.apply_move(-50_000.0, -50_000.0, c);
+        let (cx, cy) = out.center();
+        assert!((0.0..=4000.0).contains(&cx), "centre x escaped: {cx}");
+        assert!((0.0..=3000.0).contains(&cy), "centre y escaped: {cy}");
+        // It is still allowed well outside — that is the printed border.
+        assert!(out.overflows(4000.0, 3000.0));
+    }
+
+    #[test]
+    fn a_resize_sticks_to_the_size_that_lines_the_free_edge_up_with_the_photo() {
+        let c = constraints();
+        // Left edge pinned at 0; dragging the right edge to just short of the
+        // photo's right edge should land it exactly there.
+        let start = CropBox::new(0.0, 0.0, 1000.0, 1500.0);
+        let out = start.apply_drag(Handle::Right, (3990.0, 750.0), PORTRAIT, c);
+        assert!((out.right() - 4000.0).abs() < EPS, "right = {}", out.right());
+        assert!(out.x.abs() < EPS, "the pinned edge moved");
+        assert_ratio(out, PORTRAIT);
+    }
+
+    #[test]
+    fn a_resize_sticks_to_the_in_fit_size() {
+        let c = constraints();
+        let (contain_w, _) = c.contain_size(PORTRAIT);
+        let start = CropBox::new(1000.0, 0.0, contain_w - 60.0, (contain_w - 60.0) / PORTRAIT);
+        // Drag the corner out to within the snap distance of the fit size.
+        let target = start.x + contain_w - 8.0;
+        let out = start.apply_drag(Handle::BottomRight, (target, start.y + 10.0), PORTRAIT, c);
+        assert!((out.w - contain_w).abs() < EPS, "w = {} not {contain_w}", out.w);
+    }
+
+    #[test]
+    fn a_resize_holds_its_anchor() {
+        let c = constraints();
+        let start = CropBox::new(500.0, 400.0, 1200.0, 1800.0);
+        let out = start.apply_drag(Handle::TopLeft, (300.0, 100.0), PORTRAIT, c);
+        assert!((out.right() - start.right()).abs() < EPS, "anchor drifted");
+        assert!((out.bottom() - start.bottom()).abs() < EPS, "anchor drifted");
+        assert_ratio(out, PORTRAIT);
+    }
+
+    #[test]
+    fn dragging_the_move_handle_through_apply_drag_does_nothing() {
+        let c = constraints();
+        let start = CropBox::new(500.0, 400.0, 1200.0, 1800.0);
+        assert_eq!(start.apply_drag(Handle::Move, (0.0, 0.0), PORTRAIT, c), start);
+    }
+
+    #[test]
+    fn constrained_gestures_never_break_the_proportion() {
+        let c = constraints();
+        let mut b = CropBox::fit_centered(4000.0, 3000.0, PORTRAIT);
+        let handles = [
+            Handle::TopLeft,
+            Handle::Top,
+            Handle::TopRight,
+            Handle::Right,
+            Handle::BottomRight,
+            Handle::Bottom,
+            Handle::BottomLeft,
+            Handle::Left,
+        ];
+        // A long, deliberately hostile sequence of gestures.
+        for (i, handle) in handles.iter().cycle().take(120).enumerate() {
+            let x = ((i * 977) % 9000) as f64 - 2500.0;
+            let y = ((i * 613) % 7000) as f64 - 2000.0;
+            b = b.apply_drag(*handle, (x, y), PORTRAIT, c);
+            b = b.apply_move(x / 10.0, y / 10.0, c);
+            b = b.apply_zoom(if i % 3 == 0 { 1.2 } else { 0.85 }, PORTRAIT, c);
+
+            assert_ratio(b, PORTRAIT);
+            assert!(b.w >= MIN_SIZE - EPS && b.h >= MIN_SIZE - EPS, "collapsed: {b:?}");
+            let (cover_w, cover_h) = c.cover_size(PORTRAIT);
+            assert!(b.w <= cover_w + EPS && b.h <= cover_h + EPS, "overgrew: {b:?}");
+            let (cx, cy) = b.center();
+            assert!((0.0..=4000.0).contains(&cx) && (0.0..=3000.0).contains(&cy), "escaped: {b:?}");
+        }
     }
 
     #[test]

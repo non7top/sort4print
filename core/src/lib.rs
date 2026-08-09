@@ -14,10 +14,12 @@ pub mod fonts;
 pub mod geo;
 pub mod ini;
 pub mod loader;
+pub mod sidecar;
 pub mod stamp;
 
 pub use config::{AspectRatio, CaptionConfig, Color, Config, Corner, NavMode};
-pub use cropbox::{CropBox, Handle};
+pub use cropbox::{Constraints, CropBox, Handle};
+pub use sidecar::{PhotoState, Sidecar};
 pub use datefmt::{format_date, Locale, Locales, PhotoDate};
 pub use exif_data::{Orientation, PhotoMeta};
 pub use fonts::{FontCatalog, FontFace};

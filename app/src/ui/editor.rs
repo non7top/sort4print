@@ -3,21 +3,37 @@
 //! The whole photo stays visible and the area outside the cut-out is dimmed,
 //! which is the standard way to frame a crop. The view is fitted to the *union*
 //! of the photo and the crop window rather than to the photo alone, so a window
-//! dragged partly or wholly off the picture stays on screen instead of
-//! disappearing past the edge — that window is a legitimate framing choice
-//! here, not a mistake, and it previews the printed border.
+//! reaching past the edge stays on screen instead of disappearing — that window
+//! is a legitimate framing choice here, and it previews the printed border.
+//!
+//! Two zooms live here and are deliberately kept apart. The wheel resizes the
+//! *crop window*, which is the thing you are usually adjusting. Ctrl and the
+//! wheel magnifies the *view*, for looking closely at what you are about to
+//! print; it changes nothing that gets exported.
 
 use std::hash::{Hash, Hasher};
 
-use sort4print_core::cropbox::Handle;
+use sort4print_core::cropbox::{Constraints, CropBox, Handle};
 use sort4print_core::stamp::{self, StampStyle};
 
 use crate::app::{DragState, Sort4Print};
-use crate::ui::ACCENT;
+use crate::ui::{ACCENT, OK_GREEN};
 
 /// Grab radius for the handles, in screen pixels.
 const GRAB_PX: f32 = 11.0;
 const HANDLE_PX: f32 = 9.0;
+
+/// How far the view may be magnified beyond fitting the window.
+const MAX_VIEW_ZOOM: f32 = 12.0;
+
+/// Short side of the caption overlay raster.
+///
+/// Fixed on purpose. Rendering the caption at the crop's on-screen size meant
+/// re-running the whole glyph raster and its distance transform every few
+/// pixels of a drag, on the UI thread — which is exactly what made dragging
+/// feel like it was fighting back. At a fixed size the raster is produced once
+/// per caption and simply stretched, which no one can tell apart in a preview.
+const CAPTION_RASTER_SHORT_SIDE: f32 = 460.0;
 
 pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
@@ -36,8 +52,9 @@ fn empty_state(ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(
                 "Open a folder of photos to begin.\n\n\
-                 Space picks the current photo · ← → walk the folder · \
-                 drag to move the crop, drag a handle to resize it, scroll to zoom.",
+                 Space picks the current photo · ← → walk the folder\n\
+                 drag to move the crop, drag a handle to resize it\n\
+                 scroll zooms the crop · Ctrl+scroll zooms the view · Alt+arrows nudge",
             )
             .weak(),
         );
@@ -61,6 +78,7 @@ fn controls(app: &mut Sort4Print, ui: &mut egui::Ui) {
             .changed()
         {
             app.entries[index].selected = selected;
+            app.note_changed(index);
         }
 
         ui.separator();
@@ -72,11 +90,23 @@ fn controls(app: &mut Sort4Print, ui: &mut egui::Ui) {
             app.reset_crop(index);
         }
 
+        if app.view_zoom > 1.001 {
+            if ui
+                .button(format!("Fit ({:.0}%)", app.view_zoom * 100.0))
+                .on_hover_text("Back to showing the whole photo")
+                .clicked()
+            {
+                app.reset_view();
+            }
+        }
+
         ui.separator();
         ui.label(
-            egui::RichText::new("drag to move · handles resize · scroll zooms")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "drag moves · handles resize · scroll zooms the crop · Ctrl+scroll the view",
+            )
+            .small()
+            .weak(),
         );
     });
 }
@@ -97,10 +127,11 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     };
 
     let texture = app.texture_for(ui.ctx(), &path, &image);
-    let full_w = image.preview.full_w as f64;
-    let full_h = image.preview.full_h as f64;
-    let mut crop = app.crop_for(index, image.preview.full_w, image.preview.full_h);
-    let ratio = app.ratio_for(image.preview.full_w, image.preview.full_h);
+    let (image_w, image_h) = (image.preview.full_w, image.preview.full_h);
+    let full_w = image_w as f64;
+    let full_h = image_h as f64;
+    let mut crop = app.crop_for(index, image_w, image_h);
+    let ratio = app.ratio_for(image_w, image_h);
 
     let area = ui.available_rect_before_wrap();
     let response = ui.interact(
@@ -109,18 +140,20 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::Sense::click_and_drag(),
     );
 
-    // Fit the photo and the crop window together, with a little air around them.
+    // ---- view transform --------------------------------------------------
+
+    // The world is the photo and the crop window together, so neither can be
+    // pushed off screen by the other.
     let world_min_x = crop.x.min(0.0);
     let world_min_y = crop.y.min(0.0);
-    let world_max_x = crop.right().max(full_w);
-    let world_max_y = crop.bottom().max(full_h);
-    let world_w = (world_max_x - world_min_x).max(1.0);
-    let world_h = (world_max_y - world_min_y).max(1.0);
+    let world_w = (crop.right().max(full_w) - world_min_x).max(1.0);
+    let world_h = (crop.bottom().max(full_h) - world_min_y).max(1.0);
 
-    let scale = ((area.width() as f64 / world_w).min(area.height() as f64 / world_h) * 0.94)
+    let fit = ((area.width() as f64 / world_w).min(area.height() as f64 / world_h) * 0.94)
         .max(f64::MIN_POSITIVE);
+    let scale = fit * app.view_zoom as f64;
     let drawn = egui::vec2((world_w * scale) as f32, (world_h * scale) as f32);
-    let origin = area.center() - drawn / 2.0;
+    let origin = area.center() - drawn / 2.0 + app.view_pan;
 
     let to_screen = |x: f64, y: f64| {
         egui::pos2(
@@ -135,7 +168,9 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         )
     };
 
-    // ---- interaction ----------------------------------------------------
+    let constraints = app.constraints_for(image_w, image_h, scale);
+
+    // ---- interaction -----------------------------------------------------
 
     if response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -151,11 +186,20 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     }
 
     if response.dragged() {
-        if let (Some(drag), Some(pos)) = (app.drag.as_ref(), response.interact_pointer_pos()) {
+        // Dragging with the middle button, or anywhere off the crop window,
+        // slides the view rather than the crop.
+        let panning = app.drag.is_none()
+            || ui.input(|i| i.pointer.middle_down());
+        if panning {
+            app.view_pan += response.drag_delta();
+        } else if let (Some(drag), Some(pos)) = (app.drag.as_ref(), response.interact_pointer_pos())
+        {
             let world = to_world(pos);
             crop = match drag.handle {
-                Handle::Move => crop.translated(world.0 - drag.last.0, world.1 - drag.last.1),
-                handle => crop.dragged(handle, world, ratio),
+                Handle::Move => {
+                    crop.apply_move(world.0 - drag.last.0, world.1 - drag.last.1, constraints)
+                }
+                handle => crop.apply_drag(handle, world, ratio, constraints),
             };
             if let Some(drag) = app.drag.as_mut() {
                 drag.last = world;
@@ -169,24 +213,27 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     }
 
     if response.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        let (scroll, zoom_the_view) =
+            ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.command || i.modifiers.ctrl));
+
         if scroll.abs() > 0.1 {
-            // Scrolling up zooms in, i.e. makes the window smaller.
-            let factor = (1.0 - scroll as f64 * 0.0015).clamp(0.5, 2.0);
-            crop = crop.scaled_about_center(factor);
-            app.set_crop(index, crop);
+            if zoom_the_view {
+                view_zoom(app, ui, area, scroll, world_min_x, world_min_y, world_w, world_h, fit);
+            } else {
+                // Scrolling up zooms in, i.e. makes the window smaller.
+                let factor = (1.0 - scroll as f64 * 0.0015).clamp(0.5, 2.0);
+                crop = crop.apply_zoom(factor, ratio, constraints);
+                app.set_crop(index, crop);
+            }
         }
+
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
             let world = to_world(pos);
             let tolerance = GRAB_PX as f64 / scale;
             let cursor = match crop.hit_test(world.0, world.1, tolerance) {
                 Some(Handle::Move) => egui::CursorIcon::Grab,
-                Some(Handle::TopLeft) | Some(Handle::BottomRight) => {
-                    egui::CursorIcon::ResizeNwSe
-                }
-                Some(Handle::TopRight) | Some(Handle::BottomLeft) => {
-                    egui::CursorIcon::ResizeNeSw
-                }
+                Some(Handle::TopLeft) | Some(Handle::BottomRight) => egui::CursorIcon::ResizeNwSe,
+                Some(Handle::TopRight) | Some(Handle::BottomLeft) => egui::CursorIcon::ResizeNeSw,
                 Some(Handle::Left) | Some(Handle::Right) => egui::CursorIcon::ResizeHorizontal,
                 Some(Handle::Top) | Some(Handle::Bottom) => egui::CursorIcon::ResizeVertical,
                 None => egui::CursorIcon::Default,
@@ -195,7 +242,7 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         }
     }
 
-    // ---- painting -------------------------------------------------------
+    // ---- painting --------------------------------------------------------
 
     let painter = ui.painter_at(area);
     let image_rect = egui::Rect::from_min_max(to_screen(0.0, 0.0), to_screen(full_w, full_h));
@@ -204,7 +251,7 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         to_screen(crop.right(), crop.bottom()),
     );
 
-    // The window can extend past the photo; that area prints as background.
+    // The window may extend past the photo; that area prints as background.
     let background = app.config.background;
     painter.rect_filled(
         crop_rect,
@@ -222,21 +269,32 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     dim_outside(&painter, area, crop_rect);
     draw_caption_overlay(app, ui, index, crop_rect, &image);
 
+    // Picked photos get a green window, so the decision is visible without
+    // looking away from the picture.
+    let outline = if app.current_is_selected() {
+        OK_GREEN
+    } else {
+        ACCENT
+    };
+
     painter.rect_stroke(
         crop_rect,
         0.0,
-        egui::Stroke::new(1.5, ACCENT),
+        egui::Stroke::new(1.5, outline),
         egui::StrokeKind::Middle,
     );
     thirds(&painter, crop_rect);
-    handles(&painter, crop_rect);
+    handles(&painter, crop_rect, outline);
 
-    // ---- readout --------------------------------------------------------
+    // ---- readout ---------------------------------------------------------
 
     let (_, _, out_w, out_h) = crop.to_pixel_rect();
     let mut lines = vec![format!("{out_w} × {out_h} px")];
     if crop.overflows(full_w, full_h) {
-        lines.push("window extends past the photo — the rest prints as background".into());
+        lines.push("window past the photo — the rest prints as background".into());
+    }
+    if app.view_zoom > 1.001 {
+        lines.push(format!("view {:.0}%", app.view_zoom * 100.0));
     }
     painter.text(
         egui::pos2(area.left() + 8.0, area.top() + 6.0),
@@ -245,6 +303,51 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
+}
+
+/// Magnifies the view about the pointer, so whatever is under it stays there.
+#[allow(clippy::too_many_arguments)]
+fn view_zoom(
+    app: &mut Sort4Print,
+    ui: &egui::Ui,
+    area: egui::Rect,
+    scroll: f32,
+    world_min_x: f64,
+    world_min_y: f64,
+    world_w: f64,
+    world_h: f64,
+    fit: f64,
+) {
+    let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else {
+        return;
+    };
+
+    let old_zoom = app.view_zoom;
+    let new_zoom = (old_zoom * (1.0 + scroll * 0.0015)).clamp(1.0, MAX_VIEW_ZOOM);
+    if (new_zoom - old_zoom).abs() < f32::EPSILON {
+        return;
+    }
+
+    // Where the pointer is, in world coordinates, before the change.
+    let old_scale = fit * old_zoom as f64;
+    let old_drawn = egui::vec2((world_w * old_scale) as f32, (world_h * old_scale) as f32);
+    let old_origin = area.center() - old_drawn / 2.0 + app.view_pan;
+    let world_x = (pointer.x - old_origin.x) as f64 / old_scale + world_min_x;
+    let world_y = (pointer.y - old_origin.y) as f64 / old_scale + world_min_y;
+
+    // Choose the pan that puts that same world point back under the pointer.
+    let new_scale = fit * new_zoom as f64;
+    let new_drawn = egui::vec2((world_w * new_scale) as f32, (world_h * new_scale) as f32);
+    let wanted_origin = egui::pos2(
+        pointer.x - ((world_x - world_min_x) * new_scale) as f32,
+        pointer.y - ((world_y - world_min_y) * new_scale) as f32,
+    );
+
+    app.view_zoom = new_zoom;
+    app.view_pan = wanted_origin - (area.center() - new_drawn / 2.0);
+    if new_zoom <= 1.0 {
+        app.view_pan = egui::Vec2::ZERO;
+    }
 }
 
 fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect) {
@@ -277,7 +380,7 @@ fn thirds(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
-fn handles(painter: &egui::Painter, rect: egui::Rect) {
+fn handles(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let points = [
         rect.left_top(),
         rect.center_top(),
@@ -290,7 +393,7 @@ fn handles(painter: &egui::Painter, rect: egui::Rect) {
     ];
     for point in points {
         let handle = egui::Rect::from_center_size(point, egui::vec2(HANDLE_PX, HANDLE_PX));
-        painter.rect_filled(handle, 1.0, ACCENT);
+        painter.rect_filled(handle, 1.0, color);
         painter.rect_stroke(
             handle,
             1.0,
@@ -300,9 +403,9 @@ fn handles(painter: &egui::Painter, rect: egui::Rect) {
     }
 }
 
-/// Renders the caption to a transparent overlay the size of the crop rectangle
-/// on screen, so what is shown is the export's own renderer at preview scale
-/// rather than an approximation drawn with egui's text stack.
+/// Renders the caption to a transparent overlay and stretches it over the crop,
+/// so what is shown comes from the export's own renderer rather than being
+/// approximated with egui's text stack.
 fn draw_caption_overlay(
     app: &mut Sort4Print,
     ui: &mut egui::Ui,
@@ -321,9 +424,15 @@ fn draw_caption_overlay(
         return;
     };
 
-    // Rounded so that dragging the crop by a pixel does not re-render.
-    let w = (crop_rect.width().max(16.0) / 8.0).round() as u32 * 8;
-    let h = (crop_rect.height().max(16.0) / 8.0).round() as u32 * 8;
+    // The raster's proportions match the crop so the percentage-based sizes
+    // land in the same relative place; its scale is fixed so dragging never
+    // triggers a re-render.
+    let aspect = (crop_rect.width() / crop_rect.height().max(1.0)).clamp(0.05, 20.0);
+    let (w, h) = if aspect >= 1.0 {
+        ((CAPTION_RASTER_SHORT_SIDE * aspect) as u32, CAPTION_RASTER_SHORT_SIDE as u32)
+    } else {
+        (CAPTION_RASTER_SHORT_SIDE as u32, (CAPTION_RASTER_SHORT_SIDE / aspect) as u32)
+    };
     if w == 0 || h == 0 {
         return;
     }
@@ -333,14 +442,7 @@ fn draw_caption_overlay(
         text.hash(&mut hasher);
         w.hash(&mut hasher);
         h.hash(&mut hasher);
-        app.config.caption.font_family.hash(&mut hasher);
-        app.config.caption.font_style.hash(&mut hasher);
-        app.config.caption.corner.as_str().hash(&mut hasher);
-        (app.config.caption.size_pct.to_bits()).hash(&mut hasher);
-        (app.config.caption.outline_pct.to_bits()).hash(&mut hasher);
-        (app.config.caption.margin_pct.to_bits()).hash(&mut hasher);
-        app.config.caption.fill.to_hex().hash(&mut hasher);
-        app.config.caption.outline.to_hex().hash(&mut hasher);
+        caption_style_key(app, &mut hasher);
         hasher.finish()
     };
 
@@ -356,10 +458,8 @@ fn draw_caption_overlay(
             let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
             let style = StampStyle::from_config(&app.config.caption, w, h);
             stamp::draw_caption(&mut canvas, &text, &font, &style);
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                canvas.as_raw(),
-            );
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], canvas.as_raw());
             let texture =
                 ui.ctx()
                     .load_texture("caption-overlay", color, egui::TextureOptions::LINEAR);
@@ -376,6 +476,19 @@ fn draw_caption_overlay(
     );
 }
 
+fn caption_style_key(app: &Sort4Print, hasher: &mut impl Hasher) {
+    let c = &app.config.caption;
+    c.font_family.hash(hasher);
+    c.font_style.hash(hasher);
+    c.corner.as_str().hash(hasher);
+    c.size_pct.to_bits().hash(hasher);
+    c.outline_pct.to_bits().hash(hasher);
+    c.margin_pct.to_bits().hash(hasher);
+    c.fill.to_hex().hash(hasher);
+    c.outline.to_hex().hash(hasher);
+    c.uppercase.hash(hasher);
+}
+
 /// Shown in the settings panel: the caption rendered by the real renderer on a
 /// ramp that runs light to dark, so both the fill and the outline can be judged.
 pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str) {
@@ -388,15 +501,7 @@ pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str
     let key = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         sample_text.hash(&mut hasher);
-        app.config.caption.font_family.hash(&mut hasher);
-        app.config.caption.font_style.hash(&mut hasher);
-        app.config.caption.corner.as_str().hash(&mut hasher);
-        app.config.caption.size_pct.to_bits().hash(&mut hasher);
-        app.config.caption.outline_pct.to_bits().hash(&mut hasher);
-        app.config.caption.margin_pct.to_bits().hash(&mut hasher);
-        app.config.caption.fill.to_hex().hash(&mut hasher);
-        app.config.caption.outline.to_hex().hash(&mut hasher);
-        app.config.caption.uppercase.hash(&mut hasher);
+        caption_style_key(app, &mut hasher);
         hasher.finish()
     };
 
@@ -420,10 +525,8 @@ pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str
                 ..style
             };
             stamp::draw_caption(&mut canvas, sample_text, &font, &style);
-            let color = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                canvas.as_raw(),
-            );
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], canvas.as_raw());
             let texture =
                 ui.ctx()
                     .load_texture("caption-swatch", color, egui::TextureOptions::LINEAR);
@@ -433,4 +536,12 @@ pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str
     };
 
     ui.add(egui::Image::new(&texture).corner_radius(3.0));
+}
+
+/// Keeps the unused-import warning honest: `Constraints` and `CropBox` are part
+/// of this module's vocabulary even though the compiler only sees them through
+/// inference above.
+#[allow(dead_code)]
+fn _type_anchors(c: Constraints, b: CropBox) -> (Constraints, CropBox) {
+    (c, b)
 }

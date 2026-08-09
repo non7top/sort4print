@@ -160,6 +160,9 @@ pub fn output_path(output_dir: &Path, source: &Path) -> PathBuf {
 pub struct CaptionFields {
     pub city: String,
     pub country: String,
+    /// Whatever you want to call this particular spot — "Chinatown", "the back
+    /// garden". Typed per picture, not derived from anything.
+    pub description: String,
     pub date: String,
     pub filename: String,
 }
@@ -185,6 +188,7 @@ pub fn caption_text(
     place: Option<&Place>,
     city_override: Option<&str>,
     country_override: Option<&str>,
+    description: Option<&str>,
     filename: &str,
 ) -> String {
     let locale = config.locales.get_or_default(&config.date_locale);
@@ -197,6 +201,7 @@ pub fn caption_text(
             .map(str::to_string)
             .or_else(|| place.map(|p| p.country.clone()))
             .unwrap_or_default(),
+        description: description.unwrap_or_default().to_string(),
         date: meta
             .date
             .map(|d| format_date(&config.date_pattern, d, locale))
@@ -218,6 +223,7 @@ pub fn build_caption(template: &str, fields: &CaptionFields) -> String {
         .replace("{place}", &fields.place())
         .replace("{city}", &fields.city)
         .replace("{country}", &fields.country)
+        .replace("{description}", &fields.description)
         .replace("{date}", &fields.date)
         .replace("{filename}", &fields.filename);
 
@@ -369,6 +375,7 @@ mod tests {
             country: "France".into(),
             date: "Oct '25".into(),
             filename: "IMG_1234".into(),
+            ..Default::default()
         };
         assert_eq!(
             build_caption("{city}, {country}, {date}", &f),
@@ -501,12 +508,20 @@ mod tests {
         };
 
         assert_eq!(
-            caption_text(&config, &meta, Some(&place), None, None, "IMG_1"),
+            caption_text(&config, &meta, Some(&place), None, None, None, "IMG_1"),
             "Moscow, Russia, окт '25"
         );
         // A manual override wins over the geocoded value.
         assert_eq!(
-            caption_text(&config, &meta, Some(&place), Some("Москва"), Some("Россия"), "IMG_1"),
+            caption_text(
+                &config,
+                &meta,
+                Some(&place),
+                Some("Москва"),
+                Some("Россия"),
+                None,
+                "IMG_1"
+            ),
             "Москва, Россия, окт '25"
         );
     }
@@ -515,7 +530,36 @@ mod tests {
     fn caption_text_without_gps_or_date_is_empty() {
         let config = Config::default();
         let meta = PhotoMeta::default();
-        assert_eq!(caption_text(&config, &meta, None, None, None, "IMG_1"), "");
+        assert_eq!(caption_text(&config, &meta, None, None, None, None, "IMG_1"), "");
+    }
+
+    #[test]
+    fn the_description_is_a_field_of_its_own() {
+        let mut config = Config::default();
+        config.caption.template = "{description}, {city}, {country}, {date}".into();
+        let place = Place {
+            city: "San Francisco".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            distance_km: 2.0,
+        };
+        assert_eq!(
+            caption_text(
+                &config,
+                &PhotoMeta::default(),
+                Some(&place),
+                None,
+                None,
+                Some("Chinatown"),
+                "IMG_1"
+            ),
+            "Chinatown, San Francisco, United States"
+        );
+        // Leaving it empty collapses cleanly, like every other field.
+        assert_eq!(
+            caption_text(&config, &PhotoMeta::default(), Some(&place), None, None, None, "IMG_1"),
+            "San Francisco, United States"
+        );
     }
 
     #[test]
@@ -530,7 +574,7 @@ mod tests {
             distance_km: 0.0,
         };
         assert_eq!(
-            caption_text(&config, &PhotoMeta::default(), Some(&place), None, None, ""),
+            caption_text(&config, &PhotoMeta::default(), Some(&place), None, None, None, ""),
             "PARIS"
         );
     }

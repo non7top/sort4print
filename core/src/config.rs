@@ -266,10 +266,13 @@ pub struct PrefetchConfig {
 impl Default for PrefetchConfig {
     fn default() -> Self {
         PrefetchConfig {
-            ahead: 4,
-            behind: 2,
+            // Enough that holding the Next key does not outrun the decoders.
+            // A preview is a few megabytes, so twenty of them is a rounding
+            // error next to the photos themselves.
+            ahead: 10,
+            behind: 4,
             workers: 0,
-            cache: 12,
+            cache: 28,
         }
     }
 }
@@ -316,7 +319,9 @@ impl Default for Config {
             date_pattern: "{MMM} '{yy}".to_string(),
             locales: Locales::default(),
             prefetch: PrefetchConfig::default(),
-            preview_max_px: 2400,
+            // Comfortably sharper than any editor viewport, while keeping the
+            // per-step texture upload small enough not to be felt.
+            preview_max_px: 1800,
         }
     }
 }
@@ -564,9 +569,10 @@ fn comment_for(section: &str, key: &str) -> Option<String> {
              orientation tag reset since the pixels are already upright."
         }
         ("caption", "template") => {
-            "Placeholders: {city} {country} {place} {date} {filename}\n\
+            "Placeholders: {city} {country} {place} {description} {date} {filename}\n\
              {place} is city and country joined, and collapses cleanly when\n\
-             one of them is unknown."
+             one of them is unknown. {description} is the per-photo note you\n\
+             type in the panel, e.g. Chinatown."
         }
         ("caption", "size_pct") => "Font size as a percentage of the cropped image's short side.",
         ("caption", "outline_pct") => "Outline thickness as a percentage of the font size.",
