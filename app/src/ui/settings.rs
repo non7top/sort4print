@@ -450,6 +450,7 @@ fn sample_caption(app: &Sort4Print) -> String {
         &sort4print_core::export::CaptionFields {
             city: "Lisbon".into(),
             country: "Portugal".into(),
+            description: "Alfama".into(),
             date,
             filename: "IMG_0042".into(),
         },
