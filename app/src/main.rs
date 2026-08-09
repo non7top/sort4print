@@ -12,39 +12,66 @@ mod ui;
 
 use app::Sort4Print;
 
+/// Rendering backends in the order they are tried.
+///
+/// wgpu goes first because on Windows it means Direct3D 12, which works on
+/// anything that runs a current Windows. OpenGL is second: it is the lighter
+/// path where it works, but glutin cannot get a context at all on a machine
+/// with only the basic display driver or over remote desktop, which is exactly
+/// where the program looked like it was doing nothing at all.
+const BACKENDS: &[(&str, eframe::Renderer)] = &[
+    ("wgpu (Direct3D 12 / Vulkan / Metal)", eframe::Renderer::Wgpu),
+    ("glow (OpenGL)", eframe::Renderer::Glow),
+];
+
 fn main() {
     diagnostics::install_panic_hook();
     diagnostics::start_run();
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("sort4print")
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([980.0, 620.0]),
-        ..Default::default()
-    };
+    let mut failures: Vec<String> = Vec::new();
 
-    diagnostics::log("creating the window");
+    for (name, renderer) in BACKENDS {
+        diagnostics::log(&format!("opening the window with {name}"));
 
-    let result = eframe::run_native(
-        "sort4print",
-        options,
-        Box::new(|cc| {
-            diagnostics::log("graphics context ready; building the application");
-            let app = Sort4Print::new(cc);
-            diagnostics::log("application built");
-            Ok(Box::new(app))
-        }),
-    );
+        let options = eframe::NativeOptions {
+            renderer: *renderer,
+            viewport: egui::ViewportBuilder::default()
+                .with_title("sort4print")
+                .with_inner_size([1360.0, 860.0])
+                .with_min_inner_size([980.0, 620.0]),
+            ..Default::default()
+        };
 
-    match result {
-        Ok(()) => diagnostics::log("closed normally"),
-        // Overwhelmingly this is the window or the graphics backend refusing to
-        // start, which on Windows means no OpenGL 3.3 — a bare install without
-        // GPU drivers, or a remote desktop session.
-        Err(error) => diagnostics::fatal(
-            "sort4print could not open its window",
-            &format!("{error}"),
-        ),
+        // The creator is FnOnce, so each attempt needs its own.
+        let backend = *name;
+        let result = eframe::run_native(
+            "sort4print",
+            options,
+            Box::new(move |cc| {
+                diagnostics::log(&format!("graphics ready on {backend}; building the application"));
+                let app = Sort4Print::new(cc);
+                diagnostics::log("application built");
+                Ok(Box::new(app) as Box<dyn eframe::App>)
+            }),
+        );
+
+        match result {
+            Ok(()) => {
+                diagnostics::log(&format!("closed normally ({name})"));
+                return;
+            }
+            Err(error) => {
+                diagnostics::log(&format!("{name} could not start: {error}"));
+                failures.push(format!("{name}: {error}"));
+            }
+        }
     }
+
+    diagnostics::fatal(
+        "sort4print could not open its window",
+        &format!(
+            "No rendering backend would start.\n\n{}",
+            failures.join("\n")
+        ),
+    );
 }

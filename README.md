@@ -115,6 +115,19 @@ with a filter box and a style list, and previews the result live with the same
 renderer that writes the file. Picking a font that genuinely has a Black weight
 (Arial Black, Archivo Black, …) gets you one.
 
+## If it does not start
+
+Every run writes `sort4print.log` beside the exe (or in `%TEMP%` when that
+folder is read-only), and anything fatal also raises a dialog pointing at it.
+The log names the rendering backend in use.
+
+Two are compiled in and tried in order: **wgpu**, which is Direct3D 12 on
+Windows, then **glow**, which is OpenGL. OpenGL alone is not enough — glutin
+cannot create a context on a Windows install with only the basic display driver,
+or over remote desktop, and the failure is silent because a GUI build has no
+console to report it on. Carrying both backends is what the exe's size mostly
+buys.
+
 ## Known limits
 
 - **HEIC is not read.** iPhones shoot it by default. Decoding it needs libheif,
