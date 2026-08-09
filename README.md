@@ -161,12 +161,17 @@ Every run writes `sort4print.log` beside the exe (or in `%TEMP%` when that
 folder is read-only), and anything fatal also raises a dialog pointing at it.
 The log names the rendering backend in use.
 
-Two are compiled in and tried in order: **wgpu**, which is Direct3D 12 on
-Windows, then **glow**, which is OpenGL. OpenGL alone is not enough — glutin
-cannot create a context on a Windows install with only the basic display driver,
-or over remote desktop, and the failure is silent because a GUI build has no
-console to report it on. Carrying both backends is what the exe's size mostly
-buys.
+Two backends are compiled in and tried in turn: **glow**, which is OpenGL, then
+**wgpu**, which is Direct3D 12 on Windows. Neither works everywhere, and an
+Optimus laptop is the awkward case where the two halves of the same machine
+disagree — OpenGL cannot get a context on the Intel side, and wgpu's Direct3D
+path fails on the NVIDIA side with "Invalid surface".
+
+OpenGL is tried first because of *how* it fails rather than how often: it
+returns an error and lets the next backend be tried, where wgpu panics from
+inside the driver. That panic is caught, but unwinding out of a half-started
+graphics stack is not something to do by choice. Carrying both backends is what
+the exe's size mostly buys.
 
 ## Known limits
 

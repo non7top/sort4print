@@ -105,6 +105,19 @@ pub fn fatal(title: &str, detail: &str) {
 
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// True until the program has painted something.
+///
+/// While starting up, a panic is not necessarily fatal: the rendering backends
+/// are tried in turn, and one of them blowing up is a signal to try the next,
+/// not something to interrupt the user about. Once a frame has been drawn, any
+/// panic is a real one and gets a dialog.
+static STARTING_UP: AtomicBool = AtomicBool::new(true);
+
+/// Called once the first frame is on screen.
+pub fn mark_running() {
+    STARTING_UP.store(false, Ordering::SeqCst);
+}
+
 /// Routes panics to the log, and to a dialog when they are not the already
 /// handled kind from a decode worker.
 pub fn install_panic_hook() {
@@ -125,6 +138,11 @@ pub fn install_panic_hook() {
 
         if name.starts_with(WORKER_THREAD_PREFIX) {
             // Already reported against the offending file in the UI.
+            return;
+        }
+        if STARTING_UP.load(Ordering::SeqCst) {
+            // A rendering backend failing to come up is handled by trying the
+            // next one; the user only hears about it if none of them work.
             return;
         }
 

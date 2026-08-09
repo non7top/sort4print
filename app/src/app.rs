@@ -944,6 +944,10 @@ impl eframe::App for Sort4Print {
                 "first frame, available area {:?}",
                 ui.available_size()
             ));
+            // Something is on screen, so start-up is over: from here a panic is
+            // a real fault and should be put in front of the user rather than
+            // treated as a backend that needs retrying.
+            crate::diagnostics::mark_running();
         });
 
         let ctx = ui.ctx().clone();
