@@ -283,19 +283,39 @@ impl Sort4Print {
 
         match loader::scan_folder(dir) {
             Ok(files) => {
+                let notes_path = Sidecar::path_for(dir);
                 let notes = Sidecar::load(dir);
                 let restored = notes.len();
+                crate::diagnostics::log(&format!(
+                    "notes: {} ({}), {restored} photo(s) described",
+                    notes_path.display(),
+                    match std::fs::metadata(&notes_path) {
+                        Ok(meta) => format!("{} bytes", meta.len()),
+                        Err(_) => "no such file".to_string(),
+                    }
+                ));
 
+                // Notes are matched to photos by file name. Counting the
+                // matches separately from the entries read is what would tell
+                // a file that never arrived apart from one whose names do not
+                // line up with what is actually in the folder.
+                let mut matched = 0usize;
                 self.entries = files
                     .into_iter()
                     .map(|path| {
                         let mut entry = Entry::new(path);
                         if let Some(state) = notes.get(&entry.file_name()) {
                             entry.apply_state(state);
+                            matched += 1;
                         }
                         entry
                     })
                     .collect();
+                if restored > 0 || matched > 0 {
+                    crate::diagnostics::log(&format!(
+                        "{matched} of {restored} note(s) matched a photo in the folder"
+                    ));
+                }
                 self.notes = notes;
                 self.notes_dirty = false;
                 self.current = 0;
