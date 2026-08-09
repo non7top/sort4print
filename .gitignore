@@ -1,0 +1,6 @@
+/target
+/dist
+# Raw GeoNames dumps: re-downloadable, and assets/cities.bin is the committed
+# artifact that actually ships. See README for the refresh command.
+/data/*.txt
+/data/*.zip

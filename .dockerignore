@@ -1,0 +1,6 @@
+# The build context only needs to be enough to build the image itself; the
+# working tree arrives as a bind mount at run time.
+target
+dist
+data
+.git

@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same branch makes the previous run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core-tests:
+    name: Core tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The caption renderer is tested against a real font. The runner image
+      # ships fonts already, but installing a known one keeps these tests
+      # measuring the renderer rather than whatever the image happens to have.
+      - name: Install a known font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+
+      - name: Test
+        run: cargo test -p sort4print-core --locked
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compute short SHA
+        id: vars
+        shell: bash
+        run: echo "sha_short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      # The same suite again on the platform that ships. Worth the duplication:
+      # this is the only place the font enumeration walks C:\Windows\Fonts for
+      # real, and the only place the paths in the config loader are Windows ones.
+      - name: Test
+        run: cargo test -p sort4print-core --locked
+
+      - name: Build
+        run: cargo build --release -p sort4print --locked
+
+      - name: Name the artifact after the commit
+        id: artifact
+        shell: bash
+        run: |
+          NAME="sort4print-${{ steps.vars.outputs.sha_short }}.exe"
+          cp target/release/sort4print.exe "target/release/$NAME"
+          echo "path=target/release/$NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          SIZE=$(stat -c %s "target/release/$NAME")
+          echo "size_mb=$(awk "BEGIN {printf \"%.1f\", $SIZE/1048576}")" >> "$GITHUB_OUTPUT"
+
+      - name: Report size
+        shell: bash
+        run: |
+          echo "\`${{ steps.artifact.outputs.name }}\` — ${{ steps.artifact.outputs.size_mb }} MB" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload exe
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ steps.artifact.outputs.path }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Comment download link on PR
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body "Windows build ready for \`${{ steps.vars.outputs.sha_short }}\` (${{ steps.artifact.outputs.size_mb }} MB):
+          - [${{ steps.artifact.outputs.name }}](${{ steps.upload.outputs.artifact-url }})
+
+          Download, unzip, run. No installer, no runtime needed."
