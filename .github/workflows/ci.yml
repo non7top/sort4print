@@ -85,10 +85,14 @@ jobs:
         id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.artifact.outputs.name }}
+          # `name` is ignored whenever archive: false — the artifact takes the
+          # name of the file it is given, which the rename step above set.
           path: ${{ steps.artifact.outputs.path }}
           retention-days: 14
           if-no-files-found: error
+          # Hand over the exe itself rather than a zip of it, so the download
+          # link is the program and not something to unpack first.
+          archive: false
 
       - name: Comment download link on PR
         if: github.event_name == 'pull_request'
@@ -99,4 +103,4 @@ jobs:
           gh pr comment "${{ github.event.pull_request.number }}" --body "Windows build ready for \`${{ steps.vars.outputs.sha_short }}\` (${{ steps.artifact.outputs.size_mb }} MB):
           - [${{ steps.artifact.outputs.name }}](${{ steps.upload.outputs.artifact-url }})
 
-          Download, unzip, run. No installer, no runtime needed."
+          Download and run it. No unpacking, no installer, no runtime needed."
