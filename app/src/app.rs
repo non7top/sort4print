@@ -193,8 +193,30 @@ impl Sort4Print {
         // Each of these touches the filesystem and could be the thing that goes
         // wrong on a machine that is not this one, so each announces itself.
         let config_path = Config::default_path();
-        crate::diagnostics::log(&format!("settings: {}", config_path.display()));
-        let config = Config::load(&config_path).unwrap_or_default();
+        let existed = config_path.exists();
+        let config = match Config::load(&config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                // Falling back to defaults here is what made a settings file
+                // that could not be read look exactly like one that was never
+                // written, so say which it was.
+                crate::diagnostics::log(&format!(
+                    "could not read {}: {e:#} — starting from defaults",
+                    config_path.display()
+                ));
+                Config::default()
+            }
+        };
+        crate::diagnostics::log(&format!(
+            "settings: {} ({}), last folder {}",
+            config_path.display(),
+            if existed { "read" } else { "none yet" },
+            config
+                .source_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not remembered".into())
+        ));
 
         // Reading every installed font is the slowest thing at startup — a
         // Windows font folder can be a couple of hundred megabytes — so the
@@ -324,10 +346,21 @@ impl Sort4Print {
         let Some(dir) = self.config.source_dir.clone() else {
             return;
         };
+        let path = sort4print_core::sidecar::Sidecar::path_for(&dir);
         match self.notes.save(&dir) {
-            Ok(()) => self.notes_dirty = false,
+            Ok(()) => {
+                self.notes_dirty = false;
+                crate::diagnostics::log(&format!(
+                    "notes written: {} ({} photos)",
+                    path.display(),
+                    self.notes.len()
+                ));
+            }
             Err(e) => {
-                crate::diagnostics::log(&format!("could not write the notes file: {e:#}"));
+                crate::diagnostics::log(&format!(
+                    "could not write {}: {e:#}",
+                    path.display()
+                ));
                 self.status = format!("Could not save notes: {e:#}");
             }
         }
@@ -729,7 +762,9 @@ impl Sort4Print {
             .ok();
 
         // The notes describe exactly what is being exported; get them on disk
-        // before a long job starts rather than after it.
+        // before a long job starts rather than after it, and rebuild them from
+        // the entries so nothing missed by the incremental path is lost.
+        self.notes_changed_everywhere();
         self.save_notes();
 
         self.export_run = Some(ExportRun {
@@ -862,8 +897,18 @@ impl Sort4Print {
     }
 
     pub fn save_config(&mut self) {
-        if let Err(e) = self.config.save(&self.config_path) {
-            self.status = format!("Could not save settings: {e:#}");
+        match self.config.save(&self.config_path) {
+            Ok(()) => crate::diagnostics::log(&format!(
+                "settings written: {}",
+                self.config_path.display()
+            )),
+            Err(e) => {
+                crate::diagnostics::log(&format!(
+                    "could not write {}: {e:#}",
+                    self.config_path.display()
+                ));
+                self.status = format!("Could not save settings: {e:#}");
+            }
         }
         self.config_dirty = false;
     }
@@ -918,6 +963,13 @@ impl eframe::App for Sort4Print {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::diagnostics::log("closing; writing settings and notes");
+        // Rebuild the notes from what is actually on screen rather than
+        // trusting that every control remembered to report its change. The
+        // incremental path is the fast one; this is the one that has to be
+        // right, and it only runs once.
+        self.notes_changed_everywhere();
+        self.config_dirty = true;
         self.save_config();
         self.save_notes();
     }

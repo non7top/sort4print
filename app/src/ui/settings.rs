@@ -698,14 +698,40 @@ fn about_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     );
 
     ui.add_space(10.0);
-    ui.label("Settings file");
-    ui.label(
-        egui::RichText::new(app.config_path.display().to_string())
-            .small()
-            .monospace(),
+    ui.label("What is remembered, and where");
+
+    let config_path = app.config_path.clone();
+    file_line(ui, "Settings", &config_path);
+
+    let notes_path = app
+        .config
+        .source_dir
+        .as_ref()
+        .map(|dir| sort4print_core::sidecar::Sidecar::path_for(dir));
+    match &notes_path {
+        Some(path) => file_line(ui, "Notes on these photos", path),
+        None => {
+            ui.horizontal(|ui| {
+                ui.label("Notes on these photos");
+                ui.weak("no folder open");
+            });
+        }
+    }
+
+    file_line(
+        ui,
+        "Log",
+        std::path::Path::new(&crate::diagnostics::log_path_display()),
     );
-    if ui.button("Save now").clicked() {
+
+    if ui
+        .button("Save now")
+        .on_hover_text("Both files are written as you go; this forces it")
+        .clicked()
+    {
+        app.notes_changed_everywhere();
         app.save_config();
+        app.save_notes();
     }
 
     ui.add_space(10.0);
@@ -723,6 +749,31 @@ fn about_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
     ui.add_space(10.0);
     ui.label(egui::RichText::new(sort4print_core::ATTRIBUTION).small().weak());
+}
+
+/// One line of "here is the file, and here is whether it is actually there".
+/// Worth showing plainly: a settings file that is silently not being written
+/// looks exactly like one that is, until the next time you open the program.
+fn file_line(ui: &mut egui::Ui, label: &str, path: &std::path::Path) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        match std::fs::metadata(path) {
+            Ok(meta) => ui.colored_label(
+                crate::ui::OK_GREEN,
+                format!("✔ {} bytes", meta.len()),
+            ),
+            Err(_) => ui.colored_label(
+                egui::Color32::from_rgb(230, 180, 90),
+                "not written yet",
+            ),
+        };
+    });
+    ui.label(
+        egui::RichText::new(path.display().to_string())
+            .small()
+            .monospace()
+            .weak(),
+    );
 }
 
 fn color_edit(ui: &mut egui::Ui, color: &mut Color) -> bool {
