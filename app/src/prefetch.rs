@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -327,24 +326,4 @@ fn decode_job(job: &Job) -> Result<Arc<LoadedImage>, String> {
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(_) => Err("the decoder crashed on this file".to_string()),
     }
-}
-
-static PANIC_HOOK_SET: AtomicBool = AtomicBool::new(false);
-
-/// Silences the default panic printout for worker panics we already handle.
-/// Called once at startup.
-pub fn quiet_worker_panics() {
-    if PANIC_HOOK_SET.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let on_worker = std::thread::current()
-            .name()
-            .map(|n| n.starts_with("sort4print-decode"))
-            .unwrap_or(false);
-        if !on_worker {
-            default(info);
-        }
-    }));
 }

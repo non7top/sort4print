@@ -134,8 +134,23 @@ pub struct Sort4Print {
 
 impl Sort4Print {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Sort4Print {
+        // Each of these touches the filesystem and could be the thing that goes
+        // wrong on a machine that is not this one, so each announces itself.
         let config_path = Config::default_path();
+        crate::diagnostics::log(&format!("settings: {}", config_path.display()));
         let config = Config::load(&config_path).unwrap_or_default();
+
+        // Reading every installed font is the slowest thing at startup — a
+        // Windows font folder can be a couple of hundred megabytes — so the
+        // time it took is worth knowing if the window ever seems to hang.
+        let started = std::time::Instant::now();
+        let catalog = FontCatalog::scan();
+        crate::diagnostics::log(&format!(
+            "fonts: {} faces in {} families, {} ms",
+            catalog.len(),
+            catalog.families().len(),
+            started.elapsed().as_millis()
+        ));
 
         let prefetch = Prefetcher::new(
             config.prefetch.workers,
@@ -147,7 +162,7 @@ impl Sort4Print {
         let mut app = Sort4Print {
             entries: Vec::new(),
             current: 0,
-            font_catalog: Arc::new(FontCatalog::scan()),
+            font_catalog: Arc::new(catalog),
             caption_font: None,
             caption_font_key: (String::new(), String::new()),
             prefetch,
@@ -646,6 +661,16 @@ impl Sort4Print {
 
 impl eframe::App for Sort4Print {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Distinguishes "never got as far as painting" from "painted, but you
+        // are looking at an empty window".
+        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+        FIRST_FRAME.call_once(|| {
+            crate::diagnostics::log(&format!(
+                "first frame, available area {:?}",
+                ui.available_size()
+            ));
+        });
+
         let ctx = ui.ctx().clone();
 
         self.prefetch.poll();
