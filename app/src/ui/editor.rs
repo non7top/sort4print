@@ -213,18 +213,35 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     }
 
     if response.hovered() {
-        let (scroll, zoom_the_view) =
-            ui.input(|i| (i.smooth_scroll_delta.y, i.modifiers.command || i.modifiers.ctrl));
+        // egui does not hand ctrl+scroll through as a scroll: it recognises the
+        // gesture and re-emits it as a zoom, leaving the scroll delta at zero.
+        // So the view zoom has to be read from `zoom_delta`, and only the
+        // leftover plain scrolling belongs to the crop.
+        let (scroll, zoom_delta, ctrl) = ui.input(|i| {
+            (
+                i.smooth_scroll_delta.y,
+                i.zoom_delta(),
+                i.modifiers.command || i.modifiers.ctrl,
+            )
+        });
 
-        if scroll.abs() > 0.1 {
-            if zoom_the_view {
-                view_zoom(app, ui, area, scroll, world_min_x, world_min_y, world_w, world_h, fit);
-            } else {
-                // Scrolling up zooms in, i.e. makes the window smaller.
-                let factor = (1.0 - scroll as f64 * 0.0015).clamp(0.5, 2.0);
-                crop = crop.apply_zoom(factor, ratio, constraints);
-                app.set_crop(index, crop);
-            }
+        let view_factor = if (zoom_delta - 1.0).abs() > 0.001 {
+            Some(zoom_delta)
+        } else if ctrl && scroll.abs() > 0.1 {
+            // Belt and braces: if a platform ever delivers it as a plain
+            // scroll with the modifier held, treat it the same way.
+            Some(1.0 + scroll * 0.0015)
+        } else {
+            None
+        };
+
+        if let Some(factor) = view_factor {
+            view_zoom(app, ui, area, factor, world_min_x, world_min_y, world_w, world_h, fit);
+        } else if scroll.abs() > 0.1 {
+            // Scrolling up zooms in, i.e. makes the window smaller.
+            let factor = (1.0 - scroll as f64 * 0.0015).clamp(0.5, 2.0);
+            crop = crop.apply_zoom(factor, ratio, constraints);
+            app.set_crop(index, crop);
         }
 
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
@@ -306,12 +323,13 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
 }
 
 /// Magnifies the view about the pointer, so whatever is under it stays there.
+/// `factor` is multiplicative: above 1 moves closer.
 #[allow(clippy::too_many_arguments)]
 fn view_zoom(
     app: &mut Sort4Print,
     ui: &egui::Ui,
     area: egui::Rect,
-    scroll: f32,
+    factor: f32,
     world_min_x: f64,
     world_min_y: f64,
     world_w: f64,
@@ -323,7 +341,7 @@ fn view_zoom(
     };
 
     let old_zoom = app.view_zoom;
-    let new_zoom = (old_zoom * (1.0 + scroll * 0.0015)).clamp(1.0, MAX_VIEW_ZOOM);
+    let new_zoom = (old_zoom * factor).clamp(1.0, MAX_VIEW_ZOOM);
     if (new_zoom - old_zoom).abs() < f32::EPSILON {
         return;
     }
