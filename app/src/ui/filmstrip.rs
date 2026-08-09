@@ -49,20 +49,27 @@ fn header(app: &mut Sort4Print, ui: &mut egui::Ui) {
     });
 
     ui.horizontal(|ui| {
+        let mut bulk_change = false;
         if ui.small_button("All").clicked() {
             for entry in &mut app.entries {
                 entry.selected = true;
             }
+            bulk_change = true;
         }
         if ui.small_button("None").clicked() {
             for entry in &mut app.entries {
                 entry.selected = false;
             }
+            bulk_change = true;
         }
         if ui.small_button("Invert").clicked() {
             for entry in &mut app.entries {
                 entry.selected = !entry.selected;
             }
+            bulk_change = true;
+        }
+        if bulk_change {
+            app.notes_changed_everywhere();
         }
         let exported = app.exported_count();
         if exported > 0 {
@@ -101,6 +108,9 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
                 let mut ticked = selected;
                 if ui.checkbox(&mut ticked, "").changed() {
                     app.entries[index].selected = ticked;
+                    // Without this the tick is lost on the next restart: the
+                    // notes file only writes what it has been told changed.
+                    app.note_changed(index);
                 }
 
                 let cached = app.prefetch.thumb(&path);

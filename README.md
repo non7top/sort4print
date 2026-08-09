@@ -82,6 +82,24 @@ unzip -o data/cities15000.zip -d data
 ./x pack-cities
 ```
 
+## What is remembered
+
+Two files, because two different things are being remembered.
+
+**Your settings** — print size, caption text and font, date format, output
+folder, prefetch — go in `sort4print.ini` with the program. They belong to you,
+not to any particular batch of photos.
+
+**Your decisions about these photos** — which are ticked, how each is cropped,
+place overrides, descriptions — go in `sort4print-notes.ini` in the folder of
+photos. They belong to the pictures, so copying that folder elsewhere takes them
+along, and sorting a second folder does not disturb the first.
+
+Both are written as soon as you let go of a control, not only on a clean exit,
+so killing the program loses at most the gesture in progress. The one thing not
+remembered is which photos you have already exported: that is about this
+session, and the files themselves are the record.
+
 ## Settings
 
 Settings live in `sort4print.ini`, next to the exe when that folder is writable

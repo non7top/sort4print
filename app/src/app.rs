@@ -898,10 +898,16 @@ impl eframe::App for Sort4Print {
         }
         crate::ui::editor::show(self, ui);
 
-        // Write the notes once a gesture has finished, rather than on every
-        // frame of a drag, so a crop drag is one write and not a hundred.
-        if self.drag.is_none() {
+        // Both files are written once a gesture has finished rather than on
+        // every frame of one, so a crop drag or a slider sweep is a single
+        // write and not a hundred. Waiting for a clean exit is not enough:
+        // settings should survive the program being killed too.
+        let holding_something = self.drag.is_some() || ctx.input(|i| i.pointer.any_down());
+        if !holding_something {
             self.save_notes();
+            if self.config_dirty {
+                self.save_config();
+            }
         }
 
         // An export in flight repaints so its progress moves; otherwise the
