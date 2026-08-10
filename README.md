@@ -13,7 +13,10 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
 - **Crop.** The cut-out window starts as the largest centred window of your
   print proportion that fits the photo. Drag to move it, drag a handle to
   resize it — the proportions stay locked — and scroll to zoom. Edges and the
-  centre lines are magnetic, so a flush edge or an exact fit lands by hand.
+  centre lines are magnetic, so a flush edge or an exact fit lands by hand; the
+  centre pulls twice as far as an edge and wins when both are in reach, since
+  dead centre is the framing most often wanted and the most obvious when it is
+  a few pixels out.
   The window may reach past the photo, and whatever falls outside prints as the
   border colour; it will not grow past the point where the photo fits inside it
   entirely, since past there every extra pixel is border and none is picture.
@@ -91,9 +94,23 @@ folder, prefetch — go in `sort4print.ini` with the program. They belong to you
 not to any particular batch of photos.
 
 **Your decisions about these photos** — which are ticked, how each is cropped,
-place overrides, descriptions — go in `sort4print-notes.ini` in the folder of
-photos. They belong to the pictures, so copying that folder elsewhere takes them
-along, and sorting a second folder does not disturb the first.
+place overrides, descriptions, and which photo you were looking at — go in
+`sort4print-notes.ini` in the folder of photos. They belong to the pictures, so
+copying that folder elsewhere takes them along, and sorting a second folder does
+not disturb the first. Reopening a folder returns you to the photo you left off
+at; if that file has since gone, you land near where it was.
+
+Only choices actually made are recorded. Opening a photo gives it the default
+centred window, and that is not written down — it is recomputed identically next
+time — so the file's size follows the work done rather than the number of photos
+in the folder. A few hundred decisions is tens of kilobytes whether the folder
+holds two hundred pictures or eleven thousand.
+
+The notes are never overwritten in place: a new copy is written alongside,
+flushed to disk, and moved into position, keeping the previous one as
+`sort4print-notes.ini.bak`. Each file ends with an `# end` marker, so a write cut
+short by a crash or a full disk is recognised as incomplete and the backup is
+read instead of a half-set of decisions.
 
 Both are written as soon as you let go of a control, not only on a clean exit,
 so killing the program loses at most the gesture in progress. The one thing not

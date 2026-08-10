@@ -41,6 +41,9 @@ impl Handle {
 /// handles become impossible to grab and the export is pointless anyway.
 pub const MIN_SIZE: f64 = 16.0;
 
+/// How much further the centre reaches than an edge when snapping.
+pub const CENTRE_SNAP_FACTOR: f64 = 2.0;
+
 /// The photo the window is being framed against, and how eagerly the window
 /// sticks to it.
 ///
@@ -378,12 +381,21 @@ impl CropBox {
 
     /// Nudges each axis onto the image edge or the centre line when it is
     /// already close, so a flush edge is reachable by hand.
+    ///
+    /// The centre pulls harder than the edges — see `CENTRE_SNAP_FACTOR` — and
+    /// wins outright when both are in range. Dead centre is the framing people
+    /// reach for most and the one that is most obvious when it is a few pixels
+    /// out, so it gets the benefit of the doubt.
     pub fn snap_position(&self, c: Constraints) -> CropBox {
         if c.snap <= 0.0 {
             return *self;
         }
         let snap_axis = |pos: f64, size: f64, extent: f64| -> f64 {
-            [0.0, extent - size, (extent - size) / 2.0]
+            let centre = (extent - size) / 2.0;
+            if (centre - pos).abs() <= c.snap * CENTRE_SNAP_FACTOR {
+                return centre;
+            }
+            [0.0, extent - size]
                 .into_iter()
                 .filter(|candidate| (candidate - pos).abs() <= c.snap)
                 .min_by(|a, b| (a - pos).abs().total_cmp(&(b - pos).abs()))
@@ -745,6 +757,44 @@ mod tests {
         let centred = CropBox::new(990.0, 0.0, 2000.0, 3000.0);
         let out = centred.apply_move(5.0, 0.0, c);
         assert!((out.x - 1000.0).abs() < EPS, "x = {}", out.x);
+    }
+
+    #[test]
+    fn the_centre_pulls_harder_than_an_edge() {
+        let c = constraints();
+        // Centred x for a 2000-wide window on a 4000-wide photo is 1000.
+        let centred = 1000.0;
+
+        // Beyond the plain snap distance but inside the centre's wider reach.
+        let offset = c.snap * 1.5;
+        let start = CropBox::new(centred + offset, 0.0, 2000.0, 3000.0);
+        let out = start.apply_move(0.0, 0.0, c);
+        assert!((out.x - centred).abs() < EPS, "x = {} should be centred", out.x);
+
+        // Well past even that, it is left where it is.
+        let far = CropBox::new(centred + c.snap * CENTRE_SNAP_FACTOR + 30.0, 0.0, 2000.0, 3000.0);
+        let out = far.apply_move(0.0, 0.0, c);
+        assert!((out.x - far.x).abs() < EPS, "x = {} should not have moved", out.x);
+    }
+
+    #[test]
+    fn the_centre_wins_when_an_edge_is_also_in_range() {
+        // A window almost as wide as the photo puts the centre and both edges
+        // within a few pixels of each other; the centre should take it.
+        let c = Constraints::new(1000.0, 1000.0, 30.0);
+        let start = CropBox::new(6.0, 0.0, 990.0, 990.0);
+        let out = start.apply_move(0.0, 0.0, c);
+        assert!((out.x - 5.0).abs() < EPS, "x = {} should be the centre, 5", out.x);
+    }
+
+    #[test]
+    fn both_axes_stick_to_the_centre_independently() {
+        let c = constraints();
+        let start = CropBox::new(1000.0 + 10.0, 0.0 - 8.0, 2000.0, 3000.0);
+        let out = start.apply_move(0.0, 0.0, c);
+        // Centred vertically for a 3000-tall window on a 3000-tall photo is 0.
+        assert!((out.x - 1000.0).abs() < EPS);
+        assert!(out.y.abs() < EPS);
     }
 
     #[test]

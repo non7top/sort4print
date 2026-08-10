@@ -32,6 +32,12 @@ pub struct Entry {
     /// What you call this particular spot — "Chinatown". Stays with the photo,
     /// including across restarts via the folder's notes file.
     pub description: Option<String>,
+    /// True once the crop has actually been moved. Merely opening a photo gives
+    /// it the default centred window, and that is not worth recording: it is
+    /// recomputed identically next time, and writing one for every photo walked
+    /// past is what made the notes file grow with the folder rather than with
+    /// the work done.
+    pub crop_adjusted: bool,
     pub exported: bool,
 }
 
@@ -44,6 +50,7 @@ impl Entry {
             city_override: None,
             country_override: None,
             description: None,
+            crop_adjusted: false,
             exported: false,
         }
     }
@@ -51,7 +58,7 @@ impl Entry {
     fn to_state(&self) -> PhotoState {
         PhotoState {
             selected: self.selected,
-            crop: self.crop,
+            crop: if self.crop_adjusted { self.crop } else { None },
             city: self.city_override.clone(),
             country: self.country_override.clone(),
             description: self.description.clone(),
@@ -61,6 +68,8 @@ impl Entry {
     fn apply_state(&mut self, state: &PhotoState) {
         self.selected = state.selected;
         self.crop = state.crop;
+        // A crop that came back from the notes was deliberate by definition.
+        self.crop_adjusted = state.crop.is_some();
         self.city_override = state.city.clone();
         self.country_override = state.country.clone();
         self.description = state.description.clone();
@@ -186,6 +195,9 @@ pub struct Sort4Print {
     /// Per-photo choices for the open folder, mirrored to a notes file there.
     notes: Sidecar,
     notes_dirty: bool,
+    /// When the notes were last written, so a busy session does not rewrite a
+    /// large file on every frame.
+    last_notes_write: Option<std::time::Instant>,
 }
 
 impl Sort4Print {
@@ -257,6 +269,7 @@ impl Sort4Print {
             scroll_to_current: false,
             notes: Sidecar::default(),
             notes_dirty: false,
+            last_notes_write: None,
             show_settings: true,
             settings_tab: SettingsTab::Caption,
             status: String::new(),
@@ -279,7 +292,7 @@ impl Sort4Print {
 
     pub fn open_folder(&mut self, dir: &Path) {
         // Whatever was decided about the folder being left behind.
-        self.save_notes();
+        self.save_notes_now();
 
         match loader::scan_folder(dir) {
             Ok(files) => {
@@ -316,9 +329,33 @@ impl Sort4Print {
                         "{matched} of {restored} note(s) matched a photo in the folder"
                     ));
                 }
+
+                // Back to the photo that was on screen last. If that file has
+                // since gone, its old position puts you near where you were
+                // rather than back at the start of the folder.
+                self.current = notes
+                    .last_file
+                    .as_deref()
+                    .and_then(|wanted| {
+                        self.entries.iter().position(|e| e.file_name() == wanted)
+                    })
+                    .or_else(|| {
+                        notes
+                            .last_index
+                            .map(|i| i.min(self.entries.len().saturating_sub(1)))
+                    })
+                    .unwrap_or(0);
+                if self.current > 0 {
+                    self.scroll_to_current = true;
+                    crate::diagnostics::log(&format!(
+                        "resuming at {} of {}",
+                        self.current + 1,
+                        self.entries.len()
+                    ));
+                }
+
                 self.notes = notes;
                 self.notes_dirty = false;
-                self.current = 0;
                 self.reset_view();
                 self.clear_image_caches();
                 self.config.source_dir = Some(dir.to_path_buf());
@@ -359,13 +396,37 @@ impl Sort4Print {
         }
     }
 
+    /// Writes the notes if they have changed and enough time has passed.
+    ///
+    /// The throttle exists because a folder of eleven thousand photos makes the
+    /// notes big enough that writing them on every frame of a crop drag would
+    /// be real work. Anything that must not be lost calls `save_notes_now`.
     pub fn save_notes(&mut self) {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if !self.notes_dirty {
+            return;
+        }
+        if let Some(last) = self.last_notes_write {
+            if last.elapsed() < MIN_INTERVAL {
+                return;
+            }
+        }
+        self.save_notes_now();
+    }
+
+    pub fn save_notes_now(&mut self) {
         if !self.notes_dirty {
             return;
         }
         let Some(dir) = self.config.source_dir.clone() else {
             return;
         };
+
+        // Where you were is part of the notes, and is only ever needed at the
+        // moment of writing them.
+        self.notes.last_file = self.current_entry().map(Entry::file_name);
+        self.notes.last_index = Some(self.current);
+        self.last_notes_write = Some(std::time::Instant::now());
         let path = sort4print_core::sidecar::Sidecar::path_for(&dir);
         match self.notes.save(&dir) {
             Ok(()) => {
@@ -439,6 +500,9 @@ impl Sort4Print {
                 // The list has to follow, or the picture being edited scrolls
                 // out of sight after a few steps.
                 self.scroll_to_current = true;
+                // Where you got to is worth keeping, but only worth writing at
+                // the throttled rate — hence dirty rather than an immediate save.
+                self.notes_dirty = true;
                 return;
             }
         }
@@ -587,6 +651,8 @@ impl Sort4Print {
         let changed = match self.entries.get_mut(index) {
             Some(entry) if entry.crop != Some(crop) => {
                 entry.crop = Some(crop);
+                // This came from a gesture, so it is worth remembering.
+                entry.crop_adjusted = true;
                 true
             }
             _ => false,
@@ -599,6 +665,7 @@ impl Sort4Print {
     pub fn reset_crop(&mut self, index: usize) {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.crop = None;
+            entry.crop_adjusted = false;
         }
         self.note_changed(index);
     }
@@ -785,7 +852,7 @@ impl Sort4Print {
         // before a long job starts rather than after it, and rebuild them from
         // the entries so nothing missed by the incremental path is lost.
         self.notes_changed_everywhere();
-        self.save_notes();
+        self.save_notes_now();
 
         self.export_run = Some(ExportRun {
             rx,
@@ -995,7 +1062,7 @@ impl eframe::App for Sort4Print {
         self.notes_changed_everywhere();
         self.config_dirty = true;
         self.save_config();
-        self.save_notes();
+        self.save_notes_now();
     }
 }
 

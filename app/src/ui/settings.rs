@@ -731,7 +731,7 @@ fn about_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     {
         app.notes_changed_everywhere();
         app.save_config();
-        app.save_notes();
+        app.save_notes_now();
     }
 
     ui.add_space(10.0);
