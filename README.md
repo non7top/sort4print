@@ -36,6 +36,35 @@ Everything is decoded on background threads: the photos on either side of the
 one you are looking at are already loaded, rotated, measured and geocoded before
 you get to them.
 
+## Speed
+
+Three things stop a folder of eleven thousand photos being unusable.
+
+**Filmstrip rows use the thumbnail the camera already put in the file.** Reading
+a preview that is already there costs a fraction of a millisecond; decoding the
+twelve-megapixel original to produce the same postage stamp costs a hundred of
+them and a core to do it on. It is only accepted when its shape matches the
+photo's, since a few cameras pad theirs and a stretched thumbnail is worse than a
+slow one.
+
+**Decoded images are kept on disk.** Upright, already shrunk, as small JPEGs in
+the per-user cache directory — a fraction of the size of the original and a
+fraction of the time to decode. The key includes the photo's size and
+modification time, so an edited photo simply gets a new key and a stale entry can
+never be served. A budget is enforced by discarding least recently used entries.
+Everything in there is derived: deleting the directory costs time, never work.
+
+**Previews always beat thumbnails to the workers.** They are held in separate
+queues, and the thumbnail backlog is capped — scrolling a long list would
+otherwise queue thousands of jobs and leave the photo you are actually looking at
+waiting behind them. Rows still on screen ask again next frame, so dropping the
+oldest request costs nothing.
+
+**Read all** in the filmstrip goes through the whole folder once, filling the
+cache, so that browsing afterwards waits for nothing. It runs in the background,
+hands work out only as earlier jobs finish so it never gets in your way, shows
+progress, and can be stopped.
+
 ## Keyboard and mouse
 
 | | |

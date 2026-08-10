@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
+use sort4print_core::cache::DiskCache;
 use sort4print_core::geo::{CityDb, Place};
 use sort4print_core::loader::{self, Preview};
 
@@ -37,9 +38,56 @@ struct Job {
     max_px: u32,
 }
 
+/// Ordered so the *lowest* priority comes out of a max-heap first, with earlier
+/// requests winning ties.
+impl Ord for Job {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.priority.cmp(&self.priority)
+    }
+}
+
+impl PartialOrd for Job {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for Job {}
+
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+/// How many thumbnail requests may be waiting at once.
+///
+/// Scrolling a list of eleven thousand photos would otherwise queue eleven
+/// thousand jobs, and the queue was being scanned linearly for the best one on
+/// every pop while holding the lock the UI thread needs — which is a good part
+/// of why scrolling ground to a halt. Only what is on screen is worth decoding,
+/// and rows still visible ask again next frame, so dropping the oldest is
+/// self-correcting.
+const MAX_QUEUED_THUMBS: usize = 96;
+
 struct Queue {
-    jobs: Vec<Job>,
+    /// A heap: previews are few and their order matters.
+    previews: std::collections::BinaryHeap<Job>,
+    /// A ring: thumbnails are many, interchangeable, and bounded.
+    thumbs: VecDeque<Job>,
     stop: bool,
+}
+
+impl Queue {
+    /// Previews before thumbnails, always. The picture being looked at must
+    /// never wait behind a filmstrip row.
+    fn take(&mut self) -> Option<Job> {
+        self.previews.pop().or_else(|| self.thumbs.pop_front())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.previews.is_empty() && self.thumbs.is_empty()
+    }
 }
 
 struct Shared {
@@ -126,7 +174,12 @@ pub struct Prefetcher {
 }
 
 impl Prefetcher {
-    pub fn new(workers: usize, cache_limit: usize, repaint: egui::Context) -> Prefetcher {
+    pub fn new(
+        workers: usize,
+        cache_limit: usize,
+        disk_cache: Option<DiskCache>,
+        repaint: egui::Context,
+    ) -> Prefetcher {
         let worker_count = if workers == 0 {
             // Leave a core for the UI and one for the OS; more threads than
             // that just compete for memory bandwidth while decoding.
@@ -139,7 +192,8 @@ impl Prefetcher {
 
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
-                jobs: Vec::new(),
+                previews: Default::default(),
+                thumbs: VecDeque::new(),
                 stop: false,
             }),
             wake: Condvar::new(),
@@ -151,11 +205,12 @@ impl Prefetcher {
                 let shared = Arc::clone(&shared);
                 let tx: Sender<Done> = tx.clone();
                 let repaint = repaint.clone();
+                let cache = disk_cache.clone();
                 // Named so the panic hook can tell a decode crash, which is
                 // handled, from a real one, which should still be reported.
                 std::thread::Builder::new()
                     .name(format!("sort4print-decode-{i}"))
-                    .spawn(move || worker_loop(shared, tx, repaint))
+                    .spawn(move || worker_loop(shared, tx, repaint, cache))
                     .ok()
             })
             .collect();
@@ -187,14 +242,29 @@ impl Prefetcher {
         }
 
         self.inflight.insert(key);
-        let mut queue = self.shared.queue.lock().expect("prefetch queue poisoned");
-        queue.jobs.push(Job {
+        let job = Job {
             priority,
             path: path.to_path_buf(),
             kind,
             max_px,
-        });
-        drop(queue);
+        };
+
+        let mut dropped = None;
+        {
+            let mut queue = self.shared.queue.lock().expect("prefetch queue poisoned");
+            match kind {
+                JobKind::Preview => queue.previews.push(job),
+                JobKind::Thumb => {
+                    queue.thumbs.push_back(job);
+                    if queue.thumbs.len() > MAX_QUEUED_THUMBS {
+                        dropped = queue.thumbs.pop_front();
+                    }
+                }
+            }
+        }
+        if let Some(job) = dropped {
+            self.inflight.remove(&(job.path, job.kind));
+        }
         self.shared.wake.notify_one();
     }
 
@@ -202,9 +272,17 @@ impl Prefetcher {
     /// not spend time on files nobody is looking at any more.
     pub fn cancel_pending(&mut self) {
         let mut queue = self.shared.queue.lock().expect("prefetch queue poisoned");
-        for job in queue.jobs.drain(..) {
+        for job in queue.previews.drain() {
             self.inflight.remove(&(job.path, job.kind));
         }
+        for job in queue.thumbs.drain(..) {
+            self.inflight.remove(&(job.path, job.kind));
+        }
+    }
+
+    /// How much work is outstanding, for the progress readout.
+    pub fn queued(&self) -> usize {
+        self.inflight.len()
     }
 
     /// Moves finished work into the caches. Call once per frame.
@@ -262,7 +340,8 @@ impl Drop for Prefetcher {
         {
             let mut queue = self.shared.queue.lock().expect("prefetch queue poisoned");
             queue.stop = true;
-            queue.jobs.clear();
+            queue.previews.clear();
+            queue.thumbs.clear();
         }
         self.shared.wake.notify_all();
         for handle in self.workers.drain(..) {
@@ -271,7 +350,12 @@ impl Drop for Prefetcher {
     }
 }
 
-fn worker_loop(shared: Arc<Shared>, tx: Sender<Done>, repaint: egui::Context) {
+fn worker_loop(
+    shared: Arc<Shared>,
+    tx: Sender<Done>,
+    repaint: egui::Context,
+    cache: Option<DiskCache>,
+) {
     loop {
         let job = {
             let mut queue = shared.queue.lock().expect("prefetch queue poisoned");
@@ -279,14 +363,14 @@ fn worker_loop(shared: Arc<Shared>, tx: Sender<Done>, repaint: egui::Context) {
                 if queue.stop {
                     return;
                 }
-                if let Some(index) = lowest_priority(&queue.jobs) {
-                    break queue.jobs.swap_remove(index);
+                if let Some(job) = queue.take() {
+                    break job;
                 }
                 queue = shared.wake.wait(queue).expect("prefetch queue poisoned");
             }
         };
 
-        let result = decode_job(&job);
+        let result = decode_job(&job, cache.as_ref());
         if tx
             .send(Done {
                 path: job.path,
@@ -301,18 +385,14 @@ fn worker_loop(shared: Arc<Shared>, tx: Sender<Done>, repaint: egui::Context) {
     }
 }
 
-fn lowest_priority(jobs: &[Job]) -> Option<usize> {
-    jobs.iter()
-        .enumerate()
-        .min_by_key(|(_, j)| j.priority)
-        .map(|(i, _)| i)
-}
-
 /// A corrupt file must not take the process with it: image decoders are large
 /// and a malformed JPEG occasionally panics rather than returning an error.
-fn decode_job(job: &Job) -> Result<Arc<LoadedImage>, String> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        loader::load_preview(&job.path, job.max_px)
+fn decode_job(job: &Job, cache: Option<&DiskCache>) -> Result<Arc<LoadedImage>, String> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job.kind {
+        // Thumbnails go through the route that prefers the preview the camera
+        // already embedded, which is what makes a long list scrollable.
+        JobKind::Thumb => loader::load_thumb_cached(&job.path, job.max_px, cache),
+        JobKind::Preview => loader::load_preview_cached(&job.path, job.max_px, cache),
     }));
 
     match attempt {

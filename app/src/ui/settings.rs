@@ -672,7 +672,71 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     }
 
     ui.add_space(8.0);
-    ui.weak(format!("{} previews cached", app.prefetch.cached_count()));
+    ui.weak(format!("{} previews in memory", app.prefetch.cached_count()));
+
+    ui.add_space(12.0);
+    ui.label("Cache on disk");
+    ui.label(
+        egui::RichText::new(
+            "Decoded previews and thumbnails are kept on disk, so a folder opened \
+             a second time needs no decoding at all. An entry is a fraction of the \
+             size of the photo it came from, and everything here can be rebuilt \
+             from the originals — deleting it costs time, never work.",
+        )
+        .small()
+        .weak(),
+    );
+
+    changed |= ui
+        .checkbox(&mut app.config.cache.enabled, "Keep decoded images on disk")
+        .on_hover_text("Takes effect next time the program starts")
+        .changed();
+
+    let mut budget = app.config.cache.budget_mb;
+    if ui
+        .add(
+            egui::Slider::new(&mut budget, 128..=32_768)
+                .suffix(" MB")
+                .text("upper limit"),
+        )
+        .changed()
+    {
+        app.config.cache.budget_mb = budget;
+        changed = true;
+    }
+
+    if let Some(cache) = app.disk_cache.clone() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!(
+                "{} entries, {} MB",
+                cache.entry_count(),
+                cache.total_bytes() / (1024 * 1024)
+            ));
+        });
+        ui.label(
+            egui::RichText::new(cache.root().display().to_string())
+                .small()
+                .monospace()
+                .weak(),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Read the whole folder").clicked() {
+                app.start_scan_all();
+            }
+            if ui
+                .button("Empty the cache")
+                .on_hover_text("Only discards decoded copies; your photos and notes are untouched")
+                .clicked()
+            {
+                match cache.clear() {
+                    Ok(()) => app.status = "Cache emptied.".into(),
+                    Err(e) => app.status = format!("Could not empty the cache: {e:#}"),
+                }
+            }
+        });
+    } else {
+        ui.weak("Off — previews are decoded fresh every time.");
+    }
 
     if changed {
         app.config_dirty = true;

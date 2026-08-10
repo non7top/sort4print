@@ -5,6 +5,7 @@
 //! geocoding, caption layout and export pipeline are all covered by tests that
 //! run in the same disposable container that cross-compiles the Windows exe.
 
+pub mod cache;
 pub mod config;
 pub mod cropbox;
 pub mod datefmt;
@@ -17,6 +18,7 @@ pub mod loader;
 pub mod sidecar;
 pub mod stamp;
 
+pub use cache::{DiskCache, Kind};
 pub use config::{AspectRatio, CaptionConfig, Color, Config, Corner, NavMode};
 pub use cropbox::{Constraints, CropBox, Handle};
 pub use sidecar::{PhotoState, Sidecar};

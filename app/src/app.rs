@@ -122,6 +122,27 @@ pub enum SettingsTab {
     About,
 }
 
+/// A pass over the whole folder that fills the disk cache.
+///
+/// Deliberately a slow feed rather than one enormous queue: jobs are handed out
+/// only as earlier ones finish, so the queue stays short, the photo actually
+/// being looked at is never stuck behind the scan, and nothing has to be dropped
+/// to keep the backlog bounded.
+pub struct ScanAll {
+    pub next: usize,
+    pub total: usize,
+}
+
+impl ScanAll {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.next as f32 / self.total as f32
+        }
+    }
+}
+
 pub enum ExportMsg {
     Ok { index: usize },
     Failed { index: usize, error: String },
@@ -192,6 +213,10 @@ pub struct Sort4Print {
     pub export_run: Option<ExportRun>,
     /// Free-text city search box in the location panel.
     pub place_search: String,
+    pub disk_cache: Option<sort4print_core::cache::DiskCache>,
+    /// A run through the whole folder filling the cache, so browsing afterwards
+    /// waits for nothing. Holds the next index to queue.
+    pub scan_all: Option<ScanAll>,
     /// Per-photo choices for the open folder, mirrored to a notes file there.
     notes: Sidecar,
     notes_dirty: bool,
@@ -246,9 +271,20 @@ impl Sort4Print {
             started.elapsed().as_millis()
         ));
 
+        let disk_cache = config.disk_cache();
+        crate::diagnostics::log(&match &disk_cache {
+            Some(cache) => format!(
+                "image cache: {} ({} MB budget)",
+                cache.root().display(),
+                cache.budget_bytes() / (1024 * 1024)
+            ),
+            None => "image cache: off".to_string(),
+        });
+
         let prefetch = Prefetcher::new(
             config.prefetch.workers,
             config.prefetch.cache,
+            disk_cache.clone(),
             cc.egui_ctx.clone(),
         );
         let config_ratio_text = config.ratio.to_config_string();
@@ -280,6 +316,8 @@ impl Sort4Print {
             status: String::new(),
             export_run: None,
             place_search: String::new(),
+            disk_cache,
+            scan_all: None,
             config_path,
             config_dirty: false,
             config,
@@ -573,6 +611,73 @@ impl Sort4Print {
             let path = self.entries[index as usize].path.clone();
             self.prefetch
                 .request(&path, JobKind::Preview, max_px, priority);
+        }
+    }
+
+    /// Starts a pass over the whole folder, filling the cache so that browsing
+    /// afterwards waits for nothing.
+    pub fn start_scan_all(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.scan_all = Some(ScanAll {
+            next: 0,
+            total: self.entries.len(),
+        });
+        self.status = format!("Reading all {} pictures…", self.entries.len());
+        crate::diagnostics::log(&format!("scan of {} pictures started", self.entries.len()));
+    }
+
+    pub fn stop_scan_all(&mut self) {
+        if self.scan_all.take().is_some() {
+            self.status = "Stopped reading.".into();
+        }
+    }
+
+    /// Hands out a few more of the scan's photos when the workers have room.
+    fn pump_scan_all(&mut self) {
+        // Small enough that the queue never builds up, large enough to keep
+        // every worker busy.
+        const IN_FLIGHT: usize = 24;
+
+        let Some(scan) = self.scan_all.as_ref() else {
+            return;
+        };
+        let (mut next, total) = (scan.next, scan.total);
+        let max_px = self.config.preview_max_px;
+
+        while self.prefetch.queued() < IN_FLIGHT && next < total {
+            let Some(entry) = self.entries.get(next) else {
+                break;
+            };
+            let path = entry.path.clone();
+            next += 1;
+            // Far behind anything the user is waiting on.
+            self.prefetch.request(&path, JobKind::Thumb, 220, 50_000);
+            self.prefetch
+                .request(&path, JobKind::Preview, max_px, 60_000);
+        }
+
+        let finished = next >= total && self.prefetch.queued() == 0;
+        if let Some(scan) = self.scan_all.as_mut() {
+            scan.next = next;
+        }
+        if finished {
+            self.scan_all = None;
+            let freed = self.disk_cache.as_ref().map(|c| c.prune()).unwrap_or(0);
+            self.status = match self.disk_cache.as_ref() {
+                Some(cache) => format!(
+                    "Read all {total} pictures — cache now {} MB{}",
+                    cache.total_bytes() / (1024 * 1024),
+                    if freed > 0 {
+                        format!(", {} MB dropped to stay in budget", freed / (1024 * 1024))
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => format!("Read all {total} pictures (cache is off)"),
+            };
+            crate::diagnostics::log(&self.status.clone());
         }
     }
 
@@ -1051,6 +1156,7 @@ impl eframe::App for Sort4Print {
         self.poll_export();
         self.handle_keys(&ctx);
         self.schedule_prefetch();
+        self.pump_scan_all();
 
         // Panels claim their edges in this order; the editor takes whatever is
         // left, so it has to come last.
@@ -1074,9 +1180,11 @@ impl eframe::App for Sort4Print {
             }
         }
 
-        // An export in flight repaints so its progress moves; otherwise the
-        // window sleeps until something happens.
-        if self.export_run.as_ref().map(|r| r.running).unwrap_or(false) {
+        // Work in flight repaints so its progress moves; otherwise the window
+        // sleeps until something happens.
+        let busy = self.export_run.as_ref().map(|r| r.running).unwrap_or(false)
+            || self.scan_all.is_some();
+        if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
