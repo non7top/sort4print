@@ -57,6 +57,27 @@ impl PhotoState {
     }
 }
 
+/// What a read of the notes produced, and how much to trust it.
+#[derive(Debug, Clone, Default)]
+pub struct LoadResult {
+    pub sidecar: Sidecar,
+    /// Which of the two files was used.
+    pub source: Option<PathBuf>,
+    /// It was missing its end marker: either an unfinished write or a file from
+    /// a version that predates the marker. Used anyway, and worth logging.
+    pub incomplete: bool,
+    /// A file is present and has bytes in it, but nothing could be made of it.
+    /// Whatever it holds is unknown, so it must not be written over.
+    pub unreadable_file_present: bool,
+}
+
+struct Candidate {
+    sidecar: Sidecar,
+    path: PathBuf,
+    complete: bool,
+    richness: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Sidecar {
     entries: BTreeMap<String, PhotoState>,
@@ -76,25 +97,89 @@ impl Sidecar {
         folder.join(format!("{FILE_NAME}{BACKUP_SUFFIX}"))
     }
 
-    /// Reads the notes, falling back to the backup if the main file is missing
-    /// or was not finished being written. A missing pair means "no notes yet",
-    /// which is not an error.
+    /// Reads the notes, choosing the better of the file and its backup.
     pub fn load(folder: &Path) -> Sidecar {
-        let main = Sidecar::path_for(folder);
-        if let Some(sidecar) = Sidecar::read_complete(&main) {
-            return sidecar;
-        }
-        let backup = Sidecar::backup_path_for(folder);
-        Sidecar::read_complete(&backup).unwrap_or_default()
+        Sidecar::load_detailed(folder).sidecar
     }
 
-    /// `None` when the file cannot be read, or when it lacks the end marker and
-    /// is therefore a write that did not finish.
-    fn read_complete(path: &Path) -> Option<Sidecar> {
+    /// Reads the notes and says where they came from.
+    ///
+    /// The rule is *never discard what you cannot read*. A missing end marker
+    /// makes a file suspect, not worthless — it is also exactly what a file
+    /// written by an older version looks like, and treating that as corruption
+    /// is how a folder's worth of decisions got thrown away once already. So
+    /// both copies are parsed and the better one wins: complete beats
+    /// incomplete, and failing that, more decisions beat fewer.
+    ///
+    /// If neither yields anything usable while a file is nonetheless sitting
+    /// there with bytes in it, that is reported rather than papered over: the
+    /// caller must not write over something it could not understand.
+    pub fn load_detailed(folder: &Path) -> LoadResult {
+        let main_path = Sidecar::path_for(folder);
+        let backup_path = Sidecar::backup_path_for(folder);
+
+        let main = Sidecar::read_candidate(&main_path);
+        let backup = Sidecar::read_candidate(&backup_path);
+
+        // Spelled out rather than scored, because the order matters and each
+        // case means something different:
+        let best = match (main, backup) {
+            // The live file finished being written, so it is authoritative --
+            // including when it holds fewer decisions than the backup, which is
+            // what deliberately clearing them looks like.
+            (Some(main), _) if main.complete => Some(main),
+            // The live file was cut short but the backup is intact: this is the
+            // case the backup exists for.
+            (Some(_), Some(backup)) if backup.complete => Some(backup),
+            // Neither carries a marker, so both predate it or both were cut
+            // short. Nothing to go on but which knows more.
+            (Some(main), Some(backup)) => Some(if backup.richness > main.richness {
+                backup
+            } else {
+                main
+            }),
+            (Some(main), None) => Some(main),
+            (None, Some(backup)) => Some(backup),
+            (None, None) => None,
+        };
+
+        match best {
+            Some(candidate) => LoadResult {
+                sidecar: candidate.sidecar,
+                source: Some(candidate.path),
+                incomplete: !candidate.complete,
+                unreadable_file_present: false,
+            },
+            None => {
+                // Nothing usable. Was there something there at all?
+                let has_bytes = [&main_path, &backup_path].into_iter().any(|p| {
+                    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+                });
+                LoadResult {
+                    sidecar: Sidecar::default(),
+                    source: None,
+                    incomplete: false,
+                    unreadable_file_present: has_bytes,
+                }
+            }
+        }
+    }
+
+    /// `None` when the file is absent, unreadable, or says nothing at all.
+    fn read_candidate(path: &Path) -> Option<Candidate> {
         let text = std::fs::read_to_string(path).ok()?;
-        text.lines()
-            .any(|line| line.trim() == END_MARKER)
-            .then(|| Sidecar::from_ini(&Ini::parse(&text)))
+        let complete = text.lines().any(|line| line.trim() == END_MARKER);
+        let sidecar = Sidecar::from_ini(&Ini::parse(&text));
+        // A file that parses to nothing is no better than no file.
+        if sidecar.entries.is_empty() && sidecar.last_file.is_none() {
+            return None;
+        }
+        Some(Candidate {
+            richness: sidecar.entries.len(),
+            complete,
+            sidecar,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn from_ini(ini: &Ini) -> Sidecar {
@@ -430,6 +515,105 @@ mod tests {
             "the temporary file should have been moved, not left"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression that lost a folder's worth of work: a notes file written
+    /// before end markers existed has no marker, and rejecting it as corrupt
+    /// meant starting empty and then rotating the good file away.
+    #[test]
+    fn a_file_from_before_end_markers_is_still_read() {
+        let dir = scratch("legacy");
+
+        // Exactly what an older version wrote: no marker, no backup.
+        let legacy = "\
+# Notes made by sort4print about the photos in this folder.
+
+[IMG_0001.JPG]
+selected = true
+crop = 100.0,200.0,2000.0,3000.0
+description = Chinatown
+
+[IMG_0002.JPG]
+selected = true
+";
+        std::fs::write(Sidecar::path_for(&dir), legacy).unwrap();
+
+        let report = Sidecar::load_detailed(&dir);
+        assert_eq!(report.sidecar.len(), 2, "an older file must still be read");
+        assert!(report.incomplete, "and be recognised as marker-less");
+        assert!(!report.unreadable_file_present, "it was perfectly readable");
+        assert_eq!(
+            report.sidecar.get("IMG_0001.JPG").unwrap().description.as_deref(),
+            Some("Chinatown")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_complete_file_wins_even_when_the_backup_holds_more() {
+        let dir = scratch("deliberate-clear");
+
+        // A rich backup, and a complete live file with a single entry: that is
+        // what deliberately unpicking almost everything looks like, and the
+        // live file has to be believed.
+        let mut rich = Sidecar::default();
+        for i in 0..20 {
+            rich.set(
+                &format!("IMG_{i:04}.JPG"),
+                PhotoState {
+                    selected: true,
+                    ..Default::default()
+                },
+            );
+        }
+        std::fs::write(
+            Sidecar::backup_path_for(&dir),
+            format!("{}\n{END_MARKER}\n", rich.to_ini()),
+        )
+        .unwrap();
+
+        let mut lean = Sidecar::default();
+        lean.set(
+            "IMG_0000.JPG",
+            PhotoState {
+                selected: true,
+                ..Default::default()
+            },
+        );
+        std::fs::write(
+            Sidecar::path_for(&dir),
+            format!("{}\n{END_MARKER}\n", lean.to_ini()),
+        )
+        .unwrap();
+
+        assert_eq!(Sidecar::load(&dir).len(), 1, "the live file is authoritative");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_so_it_is_not_written_over() {
+        let dir = scratch("unreadable");
+        std::fs::write(Sidecar::path_for(&dir), "\u{0}\u{1}not ini at all").unwrap();
+
+        let report = Sidecar::load_detailed(&dir);
+        assert!(report.sidecar.is_empty());
+        assert!(
+            report.unreadable_file_present,
+            "a file with bytes in it that yields nothing must be flagged"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_notes_at_all_is_not_reported_as_unreadable() {
+        let dir = scratch("absent");
+        let report = Sidecar::load_detailed(&dir);
+        assert!(report.sidecar.is_empty());
+        assert!(!report.unreadable_file_present);
         std::fs::remove_dir_all(&dir).ok();
     }
 

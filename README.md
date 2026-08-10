@@ -108,9 +108,23 @@ holds two hundred pictures or eleven thousand.
 
 The notes are never overwritten in place: a new copy is written alongside,
 flushed to disk, and moved into position, keeping the previous one as
-`sort4print-notes.ini.bak`. Each file ends with an `# end` marker, so a write cut
-short by a crash or a full disk is recognised as incomplete and the backup is
-read instead of a half-set of decisions.
+`sort4print-notes.ini.bak`. Each file ends with an `# end` marker.
+
+Which copy is read follows one rule — *never discard what you cannot read*:
+
+- The live file finished being written → it wins, even if the backup holds more.
+  Deliberately unpicking everything has to be believed.
+- The live file was cut short but the backup is intact → the backup wins. This is
+  the case the backup exists for.
+- Neither carries a marker (both predate it, or both were cut short) → whichever
+  knows about more photos wins.
+- A file is there with bytes in it but nothing can be made of it → nothing is
+  written for that folder at all, and the status bar says so. An unreadable file
+  is never replaced by an empty one.
+
+A missing marker means "suspect", never "worthless": it is also exactly what a
+file from an older version looks like, and treating that as corruption is how a
+folder's worth of decisions was thrown away once.
 
 Both are written as soon as you let go of a control, not only on a clean exit,
 so killing the program loses at most the gesture in progress. The one thing not

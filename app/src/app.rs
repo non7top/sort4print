@@ -195,6 +195,10 @@ pub struct Sort4Print {
     /// Per-photo choices for the open folder, mirrored to a notes file there.
     notes: Sidecar,
     notes_dirty: bool,
+    /// Set when the folder holds notes that could not be read. Saving is then
+    /// refused for that folder, so an unreadable file is never replaced by an
+    /// empty one.
+    notes_blocked: bool,
     /// When the notes were last written, so a busy session does not rewrite a
     /// large file on every frame.
     last_notes_write: Option<std::time::Instant>,
@@ -269,6 +273,7 @@ impl Sort4Print {
             scroll_to_current: false,
             notes: Sidecar::default(),
             notes_dirty: false,
+            notes_blocked: false,
             last_notes_write: None,
             show_settings: true,
             settings_tab: SettingsTab::Caption,
@@ -296,17 +301,35 @@ impl Sort4Print {
 
         match loader::scan_folder(dir) {
             Ok(files) => {
-                let notes_path = Sidecar::path_for(dir);
-                let notes = Sidecar::load(dir);
+                let report = Sidecar::load_detailed(dir);
+                let notes = report.sidecar;
                 let restored = notes.len();
                 crate::diagnostics::log(&format!(
-                    "notes: {} ({}), {restored} photo(s) described",
-                    notes_path.display(),
-                    match std::fs::metadata(&notes_path) {
-                        Ok(meta) => format!("{} bytes", meta.len()),
-                        Err(_) => "no such file".to_string(),
+                    "notes: read {} photo(s) from {}{}",
+                    restored,
+                    report
+                        .source
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "nothing (no notes yet)".into()),
+                    if report.incomplete {
+                        " — no end marker, so written by an older version or cut short"
+                    } else {
+                        ""
                     }
                 ));
+
+                // A notes file we cannot make sense of must not be written
+                // over: whatever it holds is unknown, and guessing cost a
+                // folder's worth of decisions once already.
+                self.notes_blocked = report.unreadable_file_present;
+                if self.notes_blocked {
+                    let path = Sidecar::path_for(dir);
+                    crate::diagnostics::log(&format!(
+                        "refusing to write notes: {} exists but could not be read",
+                        path.display()
+                    ));
+                }
 
                 // Notes are matched to photos by file name. Counting the
                 // matches separately from the entries read is what would tell
@@ -416,6 +439,11 @@ impl Sort4Print {
 
     pub fn save_notes_now(&mut self) {
         if !self.notes_dirty {
+            return;
+        }
+        if self.notes_blocked {
+            self.status =
+                "Existing notes in this folder could not be read; not writing over them.".into();
             return;
         }
         let Some(dir) = self.config.source_dir.clone() else {
