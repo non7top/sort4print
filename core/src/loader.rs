@@ -137,7 +137,7 @@ pub fn load_preview_cached(
     let key = cache.and_then(|_| DiskCache::key_for(path));
 
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
-        if let Some(bytes) = cache.read(key, Kind::View) {
+        if let Some(bytes) = cache.read(key, Kind::View, max_px) {
             if let Ok((full_w, full_h)) = upright_dimensions(path) {
                 if let Ok(rgba) = decode_bytes(&bytes) {
                     let rgba = rgba.into_rgba8();
@@ -162,7 +162,7 @@ pub fn load_preview_cached(
 
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
         if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
-            let _ = cache.write(key, Kind::View, &bytes);
+            let _ = cache.write(key, Kind::View, max_px, &bytes);
         }
     }
     Ok(preview)
@@ -184,7 +184,7 @@ pub fn load_thumb_cached(
     let key = cache.and_then(|_| DiskCache::key_for(path));
 
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
-        if let Some(bytes) = cache.read(key, Kind::Thumb) {
+        if let Some(bytes) = cache.read(key, Kind::Thumb, max_px) {
             if let Ok(image) = decode_bytes(&bytes) {
                 return Ok(as_preview(image.into_rgba8(), path, meta.clone()));
             }
@@ -199,7 +199,7 @@ pub fn load_thumb_cached(
                     let shrunk = shrink_to(image, max_px).into_rgba8();
                     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
                         if let Ok(bytes) = encode_jpeg(&shrunk, CACHE_QUALITY) {
-                            let _ = cache.write(key, Kind::Thumb, &bytes);
+                            let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
                         }
                     }
                     let scale = if full_w > 0 {
@@ -223,7 +223,7 @@ pub fn load_thumb_cached(
     let preview = load_preview(path, max_px)?;
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
         if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
-            let _ = cache.write(key, Kind::Thumb, &bytes);
+            let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
         }
     }
     Ok(preview)

@@ -214,6 +214,10 @@ pub struct Sort4Print {
     /// Free-text city search box in the location panel.
     pub place_search: String,
     pub disk_cache: Option<sort4print_core::cache::DiskCache>,
+    /// Long side of the editor area in real screen pixels, measured each frame.
+    /// A laptop panel and an external monitor want different preview sizes, and
+    /// this is how that gets noticed rather than guessed.
+    pub editor_long_px: u32,
     /// A run through the whole folder filling the cache, so browsing afterwards
     /// waits for nothing. Holds the next index to queue.
     pub scan_all: Option<ScanAll>,
@@ -317,6 +321,7 @@ impl Sort4Print {
             export_run: None,
             place_search: String::new(),
             disk_cache,
+            editor_long_px: 0,
             scan_all: None,
             config_path,
             config_dirty: false,
@@ -589,7 +594,7 @@ impl Sort4Print {
         if self.entries.is_empty() {
             return;
         }
-        let max_px = self.config.preview_max_px;
+        let max_px = self.preview_target_px();
         let ahead = self.config.prefetch.ahead as isize;
         let behind = self.config.prefetch.behind as isize;
         let len = self.entries.len() as isize;
@@ -644,7 +649,7 @@ impl Sort4Print {
             return;
         };
         let (mut next, total) = (scan.next, scan.total);
-        let max_px = self.config.preview_max_px;
+        let max_px = self.preview_target_px();
 
         while self.prefetch.queued() < IN_FLIGHT && next < total {
             let Some(entry) = self.entries.get(next) else {
@@ -732,6 +737,20 @@ impl Sort4Print {
         let handle = upload(ctx, &format!("thumb:{}", path.to_string_lossy()), &image.preview.rgba);
         self.thumb_textures.insert(path.to_path_buf(), handle.clone());
         handle
+    }
+
+    /// The size previews are decoded and cached at.
+    ///
+    /// Follows the editor area, rounded up to one of a handful of buckets and
+    /// capped by the setting. Bucketing is what keeps this from making a new
+    /// cache entry for every width the window has ever had, while still giving a
+    /// laptop panel and a large monitor each a size that suits them.
+    pub fn preview_target_px(&self) -> u32 {
+        let cap = self.config.preview_max_px;
+        if self.editor_long_px == 0 {
+            return cap;
+        }
+        sort4print_core::cache::DiskCache::bucket_for(self.editor_long_px, cap)
     }
 
     /// Drops decoded images and their textures together. Anything that changes

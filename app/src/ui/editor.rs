@@ -134,6 +134,13 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let ratio = app.ratio_for(image_w, image_h);
 
     let area = ui.available_rect_before_wrap();
+
+    // Record how big this really is in screen pixels, which is what decides how
+    // sharp a preview needs to be. A laptop panel and an external monitor differ
+    // enough for it to be worth measuring rather than assuming.
+    let scale_factor = ui.ctx().pixels_per_point();
+    app.editor_long_px = (area.width().max(area.height()) * scale_factor).round() as u32;
+
     let response = ui.interact(
         area,
         ui.id().with("crop-canvas"),

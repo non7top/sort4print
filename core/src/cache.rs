@@ -111,15 +111,22 @@ impl DiskCache {
     /// Sharded by the first two characters of the key: eleven thousand photos
     /// is twenty-two thousand files, and directories that size are slow to
     /// enumerate on Windows.
-    fn entry_path(&self, key: &str, kind: Kind) -> PathBuf {
+    ///
+    /// The size an entry was made at is part of its name, for two reasons. A
+    /// preview cached for one screen is the wrong size for a bigger one, and
+    /// without this the stored copy would be served regardless and the setting
+    /// would appear to do nothing. And with it, a laptop and a large monitor
+    /// each keep their own entry instead of evicting each other's on every
+    /// swap.
+    fn entry_path(&self, key: &str, kind: Kind, size_px: u32) -> PathBuf {
         let shard = &key[..2.min(key.len())];
         self.root
             .join(shard)
-            .join(format!("{key}.{}.jpg", kind.suffix()))
+            .join(format!("{key}.{}{size_px}.jpg", kind.suffix()))
     }
 
-    pub fn read(&self, key: &str, kind: Kind) -> Option<Vec<u8>> {
-        let path = self.entry_path(key, kind);
+    pub fn read(&self, key: &str, kind: Kind, size_px: u32) -> Option<Vec<u8>> {
+        let path = self.entry_path(key, kind, size_px);
         let bytes = std::fs::read(&path).ok()?;
         if bytes.is_empty() {
             return None;
@@ -130,8 +137,8 @@ impl DiskCache {
         Some(bytes)
     }
 
-    pub fn write(&self, key: &str, kind: Kind, bytes: &[u8]) -> Result<()> {
-        let path = self.entry_path(key, kind);
+    pub fn write(&self, key: &str, kind: Kind, size_px: u32, bytes: &[u8]) -> Result<()> {
+        let path = self.entry_path(key, kind, size_px);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -145,8 +152,27 @@ impl DiskCache {
             .with_context(|| format!("moving into {}", path.display()))
     }
 
-    pub fn contains(&self, key: &str, kind: Kind) -> bool {
-        self.entry_path(key, kind).is_file()
+    pub fn contains(&self, key: &str, kind: Kind, size_px: u32) -> bool {
+        self.entry_path(key, kind, size_px).is_file()
+    }
+
+    /// Sizes a preview is cached at.
+    ///
+    /// Bucketed rather than following the window exactly, so that dragging a
+    /// window about or moving between two screens settles on one of a handful of
+    /// entries instead of making a new one for every width the window has ever
+    /// had.
+    pub const SIZE_BUCKETS: &'static [u32] = &[1000, 1400, 1800, 2200, 2800, 3600];
+
+    /// The bucket that covers `wanted`, never exceeding `cap`.
+    pub fn bucket_for(wanted: u32, cap: u32) -> u32 {
+        let cap = cap.max(Self::SIZE_BUCKETS[0]);
+        Self::SIZE_BUCKETS
+            .iter()
+            .copied()
+            .find(|bucket| *bucket >= wanted)
+            .unwrap_or(*Self::SIZE_BUCKETS.last().expect("never empty"))
+            .min(cap)
     }
 
     /// Every entry, with its size and when it was last used.
@@ -284,19 +310,19 @@ mod tests {
         let dir = scratch("roundtrip");
         let cache = DiskCache::new(dir.join("cache"), 10_000_000);
 
-        cache.write("abcdef0123456789", Kind::Thumb, b"thumb bytes").unwrap();
-        cache.write("abcdef0123456789", Kind::View, b"view bytes").unwrap();
+        cache.write("abcdef0123456789", Kind::Thumb, 220, b"thumb bytes").unwrap();
+        cache.write("abcdef0123456789", Kind::View, 1800, b"view bytes").unwrap();
 
         assert_eq!(
-            cache.read("abcdef0123456789", Kind::Thumb).as_deref(),
+            cache.read("abcdef0123456789", Kind::Thumb, 220).as_deref(),
             Some(&b"thumb bytes"[..])
         );
         assert_eq!(
-            cache.read("abcdef0123456789", Kind::View).as_deref(),
+            cache.read("abcdef0123456789", Kind::View, 1800).as_deref(),
             Some(&b"view bytes"[..])
         );
-        assert!(cache.contains("abcdef0123456789", Kind::View));
-        assert!(cache.read("no such key here!", Kind::View).is_none());
+        assert!(cache.contains("abcdef0123456789", Kind::View, 1800));
+        assert!(cache.read("no such key here!", Kind::View, 1800).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -305,7 +331,7 @@ mod tests {
     fn no_partial_files_are_left_behind() {
         let dir = scratch("partial");
         let cache = DiskCache::new(dir.join("cache"), 10_000_000);
-        cache.write("0123456789abcdef", Kind::View, b"x").unwrap();
+        cache.write("0123456789abcdef", Kind::View, 1800, b"x").unwrap();
 
         let shard = cache.root().join("01");
         let leftovers: Vec<_> = std::fs::read_dir(&shard)
@@ -326,7 +352,7 @@ mod tests {
         let payload = vec![b'x'; 1_000];
         for i in 0..10 {
             cache
-                .write(&format!("{i:016x}"), Kind::View, &payload)
+                .write(&format!("{i:016x}"), Kind::View, 1800, &payload)
                 .unwrap();
         }
         assert!(cache.total_bytes() > 3_000);
@@ -343,11 +369,50 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The whole point of the size being in the entry name: a preview made for
+    /// a laptop screen must not be handed back for a large monitor, or the
+    /// setting would appear to do nothing at all.
+    #[test]
+    fn the_same_photo_at_two_sizes_is_two_entries() {
+        let dir = scratch("sizes");
+        let cache = DiskCache::new(dir.join("cache"), 10_000_000);
+
+        cache.write("aaaaaaaaaaaaaaaa", Kind::View, 1400, b"laptop").unwrap();
+        cache.write("aaaaaaaaaaaaaaaa", Kind::View, 2800, b"monitor").unwrap();
+
+        assert_eq!(
+            cache.read("aaaaaaaaaaaaaaaa", Kind::View, 1400).as_deref(),
+            Some(&b"laptop"[..])
+        );
+        assert_eq!(
+            cache.read("aaaaaaaaaaaaaaaa", Kind::View, 2800).as_deref(),
+            Some(&b"monitor"[..])
+        );
+        // A size never cached is a miss, not the nearest thing to hand.
+        assert!(cache.read("aaaaaaaaaaaaaaaa", Kind::View, 1800).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buckets_round_up_and_respect_the_cap() {
+        // Just over a bucket goes to the next one, not back to the last.
+        assert_eq!(DiskCache::bucket_for(1401, 3600), 1800);
+        assert_eq!(DiskCache::bucket_for(1400, 3600), 1400);
+        assert_eq!(DiskCache::bucket_for(1, 3600), 1000);
+        // Beyond the largest bucket, the largest is used.
+        assert_eq!(DiskCache::bucket_for(99_999, 3600), 3600);
+        // The cap wins over the bucket.
+        assert_eq!(DiskCache::bucket_for(2800, 1800), 1800);
+        // A nonsensical cap still yields something usable.
+        assert_eq!(DiskCache::bucket_for(2800, 0), 1000);
+    }
+
     #[test]
     fn pruning_within_budget_does_nothing() {
         let dir = scratch("noprune");
         let cache = DiskCache::new(dir.join("cache"), 10_000_000);
-        cache.write("0000000000000001", Kind::View, &vec![b'x'; 100]).unwrap();
+        cache.write("0000000000000001", Kind::View, 1800, &vec![b'x'; 100]).unwrap();
         assert_eq!(cache.prune(), 0);
         assert_eq!(cache.entry_count(), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -357,7 +422,7 @@ mod tests {
     fn clearing_removes_everything_and_is_safe_when_absent() {
         let dir = scratch("clear");
         let cache = DiskCache::new(dir.join("cache"), 10_000);
-        cache.write("0000000000000001", Kind::View, b"x").unwrap();
+        cache.write("0000000000000001", Kind::View, 1800, b"x").unwrap();
         cache.clear().unwrap();
         assert_eq!(cache.entry_count(), 0);
         // Clearing again, with nothing there, is not an error.
@@ -370,7 +435,7 @@ mod tests {
         let cache = DiskCache::new(PathBuf::from("/nonexistent/sort4print"), 1_000);
         assert_eq!(cache.total_bytes(), 0);
         assert_eq!(cache.entry_count(), 0);
-        assert!(cache.read("0000000000000001", Kind::View).is_none());
+        assert!(cache.read("0000000000000001", Kind::View, 1800).is_none());
         assert_eq!(cache.prune(), 0);
     }
 }

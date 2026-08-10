@@ -662,7 +662,7 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     let mut preview_px = app.config.preview_max_px;
     if ui
-        .add(egui::Slider::new(&mut preview_px, 800..=4000).text("preview size, px"))
+        .add(egui::Slider::new(&mut preview_px, 800..=4000).text("preview size limit, px"))
         .on_hover_text("Only affects what is on screen; exports always use the original")
         .changed()
     {
@@ -670,6 +670,17 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
         app.clear_image_caches();
         changed = true;
     }
+    ui.label(
+        egui::RichText::new(format!(
+            "This screen shows the picture {} px across, so previews are being made \
+             at {} px — the nearest standard size that covers it, within the limit \
+             above. Another monitor gets its own size, and both stay cached.",
+            app.editor_long_px,
+            app.preview_target_px(),
+        ))
+        .small()
+        .weak(),
+    );
 
     ui.add_space(8.0);
     ui.weak(format!("{} previews in memory", app.prefetch.cached_count()));
