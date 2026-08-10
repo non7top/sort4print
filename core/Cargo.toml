@@ -1,0 +1,11 @@
+[package]
+name = "sort4print-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+ab_glyph.workspace = true
+ttf-parser.workspace = true

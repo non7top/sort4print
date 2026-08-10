@@ -1,0 +1,1019 @@
+//! Application state and the per-frame loop.
+//!
+//! The panels themselves live in `ui`; this module owns the data they act on
+//! and the rules that tie it together — which picture is current, what its crop
+//! is, what the caption says, and what has been exported.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
+
+use ab_glyph::FontVec;
+use sort4print_core::config::{Config, NavMode};
+use sort4print_core::cropbox::{Constraints, CropBox, Handle};
+use sort4print_core::export;
+use sort4print_core::fonts::FontCatalog;
+use sort4print_core::loader;
+use sort4print_core::sidecar::{PhotoState, Sidecar};
+
+use crate::prefetch::{JobKind, LoadedImage, Prefetcher};
+
+/// Per-picture state. Crop rectangles are stored in original-image pixels, so
+/// they survive the preview being evicted from the cache and re-decoded.
+pub struct Entry {
+    pub path: PathBuf,
+    pub selected: bool,
+    pub crop: Option<CropBox>,
+    /// Manual replacements for the geocoded values, when the nearest big town
+    /// is not the name you want on the print.
+    pub city_override: Option<String>,
+    pub country_override: Option<String>,
+    /// What you call this particular spot — "Chinatown". Stays with the photo,
+    /// including across restarts via the folder's notes file.
+    pub description: Option<String>,
+    pub exported: bool,
+}
+
+impl Entry {
+    fn new(path: PathBuf) -> Entry {
+        Entry {
+            path,
+            selected: false,
+            crop: None,
+            city_override: None,
+            country_override: None,
+            description: None,
+            exported: false,
+        }
+    }
+
+    fn to_state(&self) -> PhotoState {
+        PhotoState {
+            selected: self.selected,
+            crop: self.crop,
+            city: self.city_override.clone(),
+            country: self.country_override.clone(),
+            description: self.description.clone(),
+        }
+    }
+
+    fn apply_state(&mut self, state: &PhotoState) {
+        self.selected = state.selected;
+        self.crop = state.crop;
+        self.city_override = state.city.clone();
+        self.country_override = state.country.clone();
+        self.description = state.description.clone();
+    }
+
+    pub fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn stem(&self) -> String {
+        self.path
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// A frame's worth of keyboard state, read once so the input lock is taken
+/// once rather than a dozen times.
+struct Keys {
+    alt: bool,
+    shift: bool,
+    right: bool,
+    left: bool,
+    up: bool,
+    down: bool,
+    page_down: bool,
+    page_up: bool,
+    d: bool,
+    a: bool,
+    space: bool,
+    enter: bool,
+}
+
+pub struct DragState {
+    pub handle: Handle,
+    /// Pointer position at the last frame, in original-image pixels.
+    pub last: (f64, f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Caption,
+    Date,
+    Output,
+    Performance,
+    About,
+}
+
+pub enum ExportMsg {
+    Ok { index: usize },
+    Failed { index: usize, error: String },
+    Finished,
+}
+
+/// One picture handed to the export thread. Carries everything the thread
+/// needs so it never has to reach back into the UI state.
+struct ExportJob {
+    index: usize,
+    path: PathBuf,
+    stem: String,
+    crop: Option<CropBox>,
+    city_override: Option<String>,
+    country_override: Option<String>,
+    description: Option<String>,
+}
+
+pub struct ExportRun {
+    pub rx: Receiver<ExportMsg>,
+    pub total: usize,
+    pub done: usize,
+    pub failures: Vec<(String, String)>,
+    pub running: bool,
+}
+
+pub struct Sort4Print {
+    pub config: Config,
+    pub config_path: PathBuf,
+    pub config_dirty: bool,
+
+    pub entries: Vec<Entry>,
+    pub current: usize,
+
+    pub font_catalog: Arc<FontCatalog>,
+    caption_font: Option<Arc<FontVec>>,
+    caption_font_key: (String, String),
+
+    pub prefetch: Prefetcher,
+    textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Upload order, so the oldest texture can be dropped when the cache fills.
+    texture_order: std::collections::VecDeque<PathBuf>,
+    /// Thumbnails are tiny and there are never many on screen, so these are
+    /// simply kept.
+    thumb_textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Rendered caption swatch for the settings panel, keyed by the settings it
+    /// was rendered from so it is only rebuilt when something changes.
+    pub caption_swatch: Option<(u64, egui::TextureHandle)>,
+    /// The same idea for the caption drawn over the crop in the editor.
+    pub caption_overlay: Option<(u64, egui::TextureHandle)>,
+    /// Free-text print proportions box in the toolbar.
+    pub ratio_input: String,
+    /// Filter box above the font family list.
+    pub font_filter: String,
+
+    pub drag: Option<DragState>,
+    /// View magnification, 1.0 being "everything fits". Ctrl+scroll changes it;
+    /// it is about looking closely, and has nothing to do with the crop.
+    pub view_zoom: f32,
+    /// View offset in screen pixels, for panning once zoomed in.
+    pub view_pan: egui::Vec2,
+    /// Set when something other than a click moved the selection, so the
+    /// filmstrip knows to bring the new row into view.
+    pub scroll_to_current: bool,
+    pub show_settings: bool,
+    pub settings_tab: SettingsTab,
+    pub status: String,
+    pub export_run: Option<ExportRun>,
+    /// Free-text city search box in the location panel.
+    pub place_search: String,
+    /// Per-photo choices for the open folder, mirrored to a notes file there.
+    notes: Sidecar,
+    notes_dirty: bool,
+}
+
+impl Sort4Print {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Sort4Print {
+        // Each of these touches the filesystem and could be the thing that goes
+        // wrong on a machine that is not this one, so each announces itself.
+        let config_path = Config::default_path();
+        let existed = config_path.exists();
+        let config = match Config::load(&config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                // Falling back to defaults here is what made a settings file
+                // that could not be read look exactly like one that was never
+                // written, so say which it was.
+                crate::diagnostics::log(&format!(
+                    "could not read {}: {e:#} — starting from defaults",
+                    config_path.display()
+                ));
+                Config::default()
+            }
+        };
+        crate::diagnostics::log(&format!(
+            "settings: {} ({}), last folder {}",
+            config_path.display(),
+            if existed { "read" } else { "none yet" },
+            config
+                .source_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not remembered".into())
+        ));
+
+        // Reading every installed font is the slowest thing at startup — a
+        // Windows font folder can be a couple of hundred megabytes — so the
+        // time it took is worth knowing if the window ever seems to hang.
+        let started = std::time::Instant::now();
+        let catalog = FontCatalog::scan();
+        crate::diagnostics::log(&format!(
+            "fonts: {} faces in {} families, {} ms",
+            catalog.len(),
+            catalog.families().len(),
+            started.elapsed().as_millis()
+        ));
+
+        let prefetch = Prefetcher::new(
+            config.prefetch.workers,
+            config.prefetch.cache,
+            cc.egui_ctx.clone(),
+        );
+        let config_ratio_text = config.ratio.to_config_string();
+
+        let mut app = Sort4Print {
+            entries: Vec::new(),
+            current: 0,
+            font_catalog: Arc::new(catalog),
+            caption_font: None,
+            caption_font_key: (String::new(), String::new()),
+            prefetch,
+            textures: HashMap::new(),
+            texture_order: std::collections::VecDeque::new(),
+            thumb_textures: HashMap::new(),
+            caption_swatch: None,
+            caption_overlay: None,
+            ratio_input: config_ratio_text,
+            font_filter: String::new(),
+            drag: None,
+            view_zoom: 1.0,
+            view_pan: egui::Vec2::ZERO,
+            scroll_to_current: false,
+            notes: Sidecar::default(),
+            notes_dirty: false,
+            show_settings: true,
+            settings_tab: SettingsTab::Caption,
+            status: String::new(),
+            export_run: None,
+            place_search: String::new(),
+            config_path,
+            config_dirty: false,
+            config,
+        };
+
+        if let Some(dir) = app.config.source_dir.clone() {
+            if dir.is_dir() {
+                app.open_folder(&dir);
+            }
+        }
+        app
+    }
+
+    // ---- folder and selection -------------------------------------------
+
+    pub fn open_folder(&mut self, dir: &Path) {
+        // Whatever was decided about the folder being left behind.
+        self.save_notes();
+
+        match loader::scan_folder(dir) {
+            Ok(files) => {
+                let notes_path = Sidecar::path_for(dir);
+                let notes = Sidecar::load(dir);
+                let restored = notes.len();
+                crate::diagnostics::log(&format!(
+                    "notes: {} ({}), {restored} photo(s) described",
+                    notes_path.display(),
+                    match std::fs::metadata(&notes_path) {
+                        Ok(meta) => format!("{} bytes", meta.len()),
+                        Err(_) => "no such file".to_string(),
+                    }
+                ));
+
+                // Notes are matched to photos by file name. Counting the
+                // matches separately from the entries read is what would tell
+                // a file that never arrived apart from one whose names do not
+                // line up with what is actually in the folder.
+                let mut matched = 0usize;
+                self.entries = files
+                    .into_iter()
+                    .map(|path| {
+                        let mut entry = Entry::new(path);
+                        if let Some(state) = notes.get(&entry.file_name()) {
+                            entry.apply_state(state);
+                            matched += 1;
+                        }
+                        entry
+                    })
+                    .collect();
+                if restored > 0 || matched > 0 {
+                    crate::diagnostics::log(&format!(
+                        "{matched} of {restored} note(s) matched a photo in the folder"
+                    ));
+                }
+                self.notes = notes;
+                self.notes_dirty = false;
+                self.current = 0;
+                self.reset_view();
+                self.clear_image_caches();
+                self.config.source_dir = Some(dir.to_path_buf());
+                self.config_dirty = true;
+                self.status = format!(
+                    "{} — {} picture{}{}",
+                    dir.display(),
+                    self.entries.len(),
+                    if self.entries.len() == 1 { "" } else { "s" },
+                    if restored > 0 {
+                        format!(", {restored} with notes from last time")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            Err(e) => self.status = format!("Could not open folder: {e:#}"),
+        }
+    }
+
+    /// Records that the per-photo state changed, so it gets written out.
+    /// Cheap to call from anywhere a control is touched.
+    pub fn note_changed(&mut self, index: usize) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        let name = entry.file_name();
+        let state = entry.to_state();
+        self.notes.set(&name, state);
+        self.notes_dirty = true;
+    }
+
+    /// Re-reads every entry into the notes. Used after bulk operations, where
+    /// tracking each change individually would be more code than it is worth.
+    pub fn notes_changed_everywhere(&mut self) {
+        for index in 0..self.entries.len() {
+            self.note_changed(index);
+        }
+    }
+
+    pub fn save_notes(&mut self) {
+        if !self.notes_dirty {
+            return;
+        }
+        let Some(dir) = self.config.source_dir.clone() else {
+            return;
+        };
+        let path = sort4print_core::sidecar::Sidecar::path_for(&dir);
+        match self.notes.save(&dir) {
+            Ok(()) => {
+                self.notes_dirty = false;
+                crate::diagnostics::log(&format!(
+                    "notes written: {} ({} photos)",
+                    path.display(),
+                    self.notes.len()
+                ));
+            }
+            Err(e) => {
+                crate::diagnostics::log(&format!(
+                    "could not write {}: {e:#}",
+                    path.display()
+                ));
+                self.status = format!("Could not save notes: {e:#}");
+            }
+        }
+    }
+
+    pub fn reset_view(&mut self) {
+        self.view_zoom = 1.0;
+        self.view_pan = egui::Vec2::ZERO;
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.selected).count()
+    }
+
+    pub fn exported_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.exported).count()
+    }
+
+    pub fn current_entry(&self) -> Option<&Entry> {
+        self.entries.get(self.current)
+    }
+
+    pub fn toggle_current(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.current) {
+            entry.selected = !entry.selected;
+        }
+        self.note_changed(self.current);
+    }
+
+    pub fn current_is_selected(&self) -> bool {
+        self.current_entry().map(|e| e.selected).unwrap_or(false)
+    }
+
+    /// Steps through the folder, honouring the All / Only selected switch.
+    /// Falls back to plain stepping when nothing is selected, so the switch can
+    /// never strand you on a picture with no way forward.
+    pub fn step(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let len = self.entries.len();
+        let restrict = self.config.nav == NavMode::Selected && self.selected_count() > 0;
+
+        let mut index = self.current as isize;
+        for _ in 0..len {
+            index += delta;
+            if index < 0 {
+                index = len as isize - 1;
+            } else if index >= len as isize {
+                index = 0;
+            }
+            if !restrict || self.entries[index as usize].selected {
+                self.current = index as usize;
+                // A close-up of one photo says nothing about the next.
+                self.reset_view();
+                // The list has to follow, or the picture being edited scrolls
+                // out of sight after a few steps.
+                self.scroll_to_current = true;
+                return;
+            }
+        }
+    }
+
+    pub fn go_to(&mut self, index: usize) {
+        if index < self.entries.len() && index != self.current {
+            self.current = index;
+            self.reset_view();
+        }
+    }
+
+    // ---- images ----------------------------------------------------------
+
+    /// Queues decodes around the current position: the picture in view first,
+    /// then outwards, so a forward walk is always already loaded.
+    fn schedule_prefetch(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let max_px = self.config.preview_max_px;
+        let ahead = self.config.prefetch.ahead as isize;
+        let behind = self.config.prefetch.behind as isize;
+        let len = self.entries.len() as isize;
+        let current = self.current as isize;
+
+        for offset in -behind..=ahead {
+            let index = current + offset;
+            if index < 0 || index >= len {
+                continue;
+            }
+            // Priority is distance from the current picture; forward steps are
+            // marginally cheaper than backward ones because that is the
+            // direction people move through a folder.
+            let priority = if offset >= 0 {
+                offset as u32 * 2
+            } else {
+                (-offset) as u32 * 2 + 1
+            };
+            let path = self.entries[index as usize].path.clone();
+            self.prefetch
+                .request(&path, JobKind::Preview, max_px, priority);
+        }
+    }
+
+    pub fn request_thumb(&mut self, index: usize) {
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        let path = entry.path.clone();
+        // Well below every preview job so thumbnails never delay the picture
+        // actually being looked at.
+        self.prefetch.request(&path, JobKind::Thumb, 220, 10_000);
+    }
+
+    /// Uploads (once) and returns the GPU texture for a preview.
+    pub fn texture_for(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        image: &LoadedImage,
+    ) -> egui::TextureHandle {
+        if let Some(existing) = self.textures.get(path) {
+            return existing.clone();
+        }
+        let handle = upload(ctx, &path.to_string_lossy(), &image.preview.rgba);
+        self.textures.insert(path.to_path_buf(), handle.clone());
+        self.texture_order.push_back(path.to_path_buf());
+
+        // Evict one at a time, oldest first. Emptying the whole map when it
+        // filled up meant every visible photo had to be re-uploaded at once,
+        // which is a stall you can feel; dropping the least recent costs
+        // nothing noticeable.
+        let limit = self.config.prefetch.cache.max(4);
+        while self.texture_order.len() > limit {
+            if let Some(oldest) = self.texture_order.pop_front() {
+                if oldest != path {
+                    self.textures.remove(&oldest);
+                }
+            }
+        }
+        handle
+    }
+
+    pub fn thumb_texture_for(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Path,
+        image: &LoadedImage,
+    ) -> egui::TextureHandle {
+        if let Some(existing) = self.thumb_textures.get(path) {
+            return existing.clone();
+        }
+        let handle = upload(ctx, &format!("thumb:{}", path.to_string_lossy()), &image.preview.rgba);
+        self.thumb_textures.insert(path.to_path_buf(), handle.clone());
+        handle
+    }
+
+    /// Drops decoded images and their textures together. Anything that changes
+    /// what a preview should look like has to clear both, or the old textures
+    /// stay on screen at the wrong size.
+    pub fn clear_image_caches(&mut self) {
+        self.prefetch.clear();
+        self.textures.clear();
+        self.texture_order.clear();
+        self.thumb_textures.clear();
+        self.caption_overlay = None;
+    }
+
+    // ---- crop ------------------------------------------------------------
+
+    /// Width divided by height for the current settings, given the shape of the
+    /// image the crop is going on.
+    pub fn ratio_for(&self, image_w: u32, image_h: u32) -> f64 {
+        if self.config.ratio_follows_image {
+            self.config.ratio.value(image_w >= image_h)
+        } else {
+            self.config.ratio.w / self.config.ratio.h
+        }
+    }
+
+    /// The crop for a picture, created in-fit and centred the first time it is
+    /// needed.
+    pub fn crop_for(&mut self, index: usize, full_w: u32, full_h: u32) -> CropBox {
+        let ratio = self.ratio_for(full_w, full_h);
+        let entry = &mut self.entries[index];
+        *entry.crop.get_or_insert_with(|| {
+            CropBox::fit_centered(full_w as f64, full_h as f64, ratio)
+        })
+    }
+
+    /// The photo's edges and how strongly the window sticks to them. The snap
+    /// distance is given in image pixels but chosen in screen pixels, so it
+    /// feels the same however far the view is zoomed in.
+    pub fn constraints_for(&self, image_w: u32, image_h: u32, screen_per_image: f64) -> Constraints {
+        const SNAP_SCREEN_PX: f64 = 9.0;
+        let snap = if screen_per_image > 0.0 {
+            SNAP_SCREEN_PX / screen_per_image
+        } else {
+            0.0
+        };
+        Constraints::new(image_w as f64, image_h as f64, snap)
+    }
+
+    pub fn set_crop(&mut self, index: usize, crop: CropBox) {
+        let changed = match self.entries.get_mut(index) {
+            Some(entry) if entry.crop != Some(crop) => {
+                entry.crop = Some(crop);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.note_changed(index);
+        }
+    }
+
+    pub fn reset_crop(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.crop = None;
+        }
+        self.note_changed(index);
+    }
+
+    /// Re-proportions every crop already made. Called when the print size
+    /// changes so existing framing is kept rather than thrown away.
+    pub fn reflow_crops(&mut self) {
+        let follows = self.config.ratio_follows_image;
+        let ratio = self.config.ratio;
+        for entry in &mut self.entries {
+            let Some(crop) = entry.crop else { continue };
+            let r = if follows {
+                ratio.value(crop.w >= crop.h)
+            } else {
+                ratio.w / ratio.h
+            };
+            entry.crop = Some(crop.with_ratio(r));
+        }
+    }
+
+    // ---- caption ---------------------------------------------------------
+
+    /// Loads the configured font, reloading it when the setting changes.
+    /// `None` means no font could be found at all, in which case captions are
+    /// silently skipped rather than blocking the export.
+    pub fn caption_font(&mut self) -> Option<Arc<FontVec>> {
+        let key = (
+            self.config.caption.font_family.clone(),
+            self.config.caption.font_style.clone(),
+        );
+        if self.caption_font.is_some() && self.caption_font_key == key {
+            return self.caption_font.clone();
+        }
+
+        let face = self
+            .font_catalog
+            .best_match(&key.0, &key.1)
+            .cloned();
+        self.caption_font_key = key;
+        self.caption_font = face.and_then(|f| {
+            let data = f.read().ok()?;
+            FontVec::try_from_vec_and_index(data, f.index).ok().map(Arc::new)
+        });
+        self.caption_font.clone()
+    }
+
+    pub fn caption_for(&self, index: usize, image: Option<&LoadedImage>) -> String {
+        let Some(entry) = self.entries.get(index) else {
+            return String::new();
+        };
+        let meta = image
+            .map(|i| i.preview.meta.clone())
+            .unwrap_or_default();
+        export::caption_text(
+            &self.config,
+            &meta,
+            image.and_then(|i| i.place.as_ref()),
+            entry.city_override.as_deref(),
+            entry.country_override.as_deref(),
+            entry.description.as_deref(),
+            &entry.stem(),
+        )
+    }
+
+    // ---- export ----------------------------------------------------------
+
+    pub fn can_export(&self) -> bool {
+        self.config.output_dir.is_some()
+            && self.selected_count() > 0
+            && self.export_run.as_ref().map(|r| !r.running).unwrap_or(true)
+    }
+
+    /// Exports every ticked picture on a background thread. Full-resolution
+    /// decoding of a folder's worth of photos takes long enough that doing it
+    /// on the UI thread would look like a hang.
+    pub fn start_export(&mut self) {
+        let Some(output_dir) = self.config.output_dir.clone() else {
+            self.status = "Choose an output folder first.".into();
+            return;
+        };
+
+        // Every selected picture needs a crop; ones never opened get the
+        // default in-fit centred window, which needs the real image size.
+        let jobs: Vec<ExportJob> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.selected)
+            .map(|(i, e)| ExportJob {
+                index: i,
+                path: e.path.clone(),
+                stem: e.stem(),
+                crop: e.crop,
+                city_override: e.city_override.clone(),
+                country_override: e.country_override.clone(),
+                description: e.description.clone(),
+            })
+            .collect();
+
+        if jobs.is_empty() {
+            self.status = "Nothing is selected.".into();
+            return;
+        }
+
+        let config = self.config.clone();
+        let font = self.caption_font();
+        let ratio = self.config.ratio;
+        let follows = self.config.ratio_follows_image;
+
+        let (tx, rx) = channel();
+        let total = jobs.len();
+
+        std::thread::Builder::new()
+            .name("sort4print-export".into())
+            .spawn(move || {
+                for job in jobs {
+                    let ExportJob {
+                        index,
+                        path,
+                        stem,
+                        crop,
+                        city_override,
+                        country_override,
+                        description,
+                    } = job;
+                    let result = (|| -> anyhow::Result<()> {
+                        let crop = match crop {
+                            Some(c) => c,
+                            None => {
+                                // Nobody framed this one: read the real size and
+                                // use the default in-fit centred window.
+                                let (w, h) = image_size(&path)?;
+                                let r = if follows {
+                                    ratio.value(w >= h)
+                                } else {
+                                    ratio.w / ratio.h
+                                };
+                                CropBox::fit_centered(w as f64, h as f64, r)
+                            }
+                        };
+                        // The caption is rebuilt here rather than on the UI
+                        // thread so it is correct for pictures that were never
+                        // opened and so never went through the preview cache.
+                        let meta = sort4print_core::exif_data::read_meta(&path);
+                        let place = meta
+                            .gps
+                            .and_then(|(lat, lon)| sort4print_core::geo::CityDb::embedded().nearest(lat, lon));
+                        let caption = export::caption_text(
+                            &config,
+                            &meta,
+                            place.as_ref(),
+                            city_override.as_deref(),
+                            country_override.as_deref(),
+                            description.as_deref(),
+                            &stem,
+                        );
+                        export::export(
+                            &path,
+                            &output_dir,
+                            &crop,
+                            &config,
+                            &caption,
+                            font.as_deref(),
+                        )?;
+                        Ok(())
+                    })();
+
+                    let message = match result {
+                        Ok(()) => ExportMsg::Ok { index },
+                        Err(e) => ExportMsg::Failed {
+                            index,
+                            error: format!("{e:#}"),
+                        },
+                    };
+                    if tx.send(message).is_err() {
+                        return;
+                    }
+                }
+                let _ = tx.send(ExportMsg::Finished);
+            })
+            .ok();
+
+        // The notes describe exactly what is being exported; get them on disk
+        // before a long job starts rather than after it, and rebuild them from
+        // the entries so nothing missed by the incremental path is lost.
+        self.notes_changed_everywhere();
+        self.save_notes();
+
+        self.export_run = Some(ExportRun {
+            rx,
+            total,
+            done: 0,
+            failures: Vec::new(),
+            running: true,
+        });
+        self.status = format!("Exporting {total} picture{}…", if total == 1 { "" } else { "s" });
+    }
+
+    fn poll_export(&mut self) {
+        let Some(run) = self.export_run.as_mut() else {
+            return;
+        };
+        let mut finished = false;
+        let mut completed: Vec<usize> = Vec::new();
+        let mut failures: Vec<(usize, String)> = Vec::new();
+
+        while let Ok(message) = run.rx.try_recv() {
+            match message {
+                ExportMsg::Ok { index } => {
+                    run.done += 1;
+                    completed.push(index);
+                }
+                ExportMsg::Failed { index, error } => {
+                    run.done += 1;
+                    failures.push((index, error));
+                }
+                ExportMsg::Finished => finished = true,
+            }
+        }
+
+        for index in completed {
+            if let Some(entry) = self.entries.get_mut(index) {
+                entry.exported = true;
+            }
+        }
+        for (index, error) in failures {
+            let name = self
+                .entries
+                .get(index)
+                .map(Entry::file_name)
+                .unwrap_or_default();
+            if let Some(run) = self.export_run.as_mut() {
+                run.failures.push((name, error));
+            }
+        }
+
+        if finished {
+            if let Some(run) = self.export_run.as_mut() {
+                run.running = false;
+                let failed = run.failures.len();
+                self.status = if failed == 0 {
+                    format!("Exported {} picture(s).", run.done)
+                } else {
+                    format!("Exported {} picture(s), {failed} failed.", run.done - failed)
+                };
+            }
+        }
+    }
+
+    // ---- frame -----------------------------------------------------------
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // A text field has focus: leave the letters and arrows to it.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let keys = ctx.input(|i| Keys {
+            alt: i.modifiers.alt,
+            shift: i.modifiers.shift,
+            right: i.key_pressed(egui::Key::ArrowRight),
+            left: i.key_pressed(egui::Key::ArrowLeft),
+            up: i.key_pressed(egui::Key::ArrowUp),
+            down: i.key_pressed(egui::Key::ArrowDown),
+            page_down: i.key_pressed(egui::Key::PageDown),
+            page_up: i.key_pressed(egui::Key::PageUp),
+            d: i.key_pressed(egui::Key::D),
+            a: i.key_pressed(egui::Key::A),
+            space: i.key_pressed(egui::Key::Space),
+            enter: i.key_pressed(egui::Key::Enter),
+        });
+
+        // Alt turns the arrows into a nudge of the crop window rather than a
+        // step through the folder — the two gestures are close enough in intent
+        // that sharing the keys reads naturally, and far enough apart that they
+        // must not be confused.
+        if keys.alt && (keys.left || keys.right || keys.up || keys.down) {
+            let step = if keys.shift { 40.0 } else { 8.0 };
+            let dx = f64::from(i32::from(keys.right) - i32::from(keys.left)) * step;
+            let dy = f64::from(i32::from(keys.down) - i32::from(keys.up)) * step;
+            self.nudge_crop(dx, dy);
+            return;
+        }
+
+        if keys.right || keys.page_down || keys.d {
+            self.step(1);
+        }
+        if keys.left || keys.page_up || keys.a {
+            self.step(-1);
+        }
+        if keys.space {
+            self.toggle_current();
+        }
+        if keys.enter && self.can_export() {
+            self.start_export();
+        }
+    }
+
+    /// Moves the crop window by whole image pixels, with the same sticking and
+    /// bounds a drag would get.
+    pub fn nudge_crop(&mut self, dx: f64, dy: f64) {
+        let index = self.current;
+        let Some(entry) = self.entries.get(index) else {
+            return;
+        };
+        // Only a photo already measured can be nudged; anything else has no
+        // crop yet and no dimensions to constrain one with.
+        let path = entry.path.clone();
+        let Some(image) = self.prefetch.preview(&path) else {
+            return;
+        };
+        let (w, h) = (image.preview.full_w, image.preview.full_h);
+        let crop = self.crop_for(index, w, h);
+        // Nudges are in image pixels, so the snap distance is too.
+        let constraints = Constraints::new(w as f64, h as f64, 6.0);
+        self.set_crop(index, crop.apply_move(dx, dy, constraints));
+    }
+
+    pub fn save_config(&mut self) {
+        match self.config.save(&self.config_path) {
+            Ok(()) => crate::diagnostics::log(&format!(
+                "settings written: {}",
+                self.config_path.display()
+            )),
+            Err(e) => {
+                crate::diagnostics::log(&format!(
+                    "could not write {}: {e:#}",
+                    self.config_path.display()
+                ));
+                self.status = format!("Could not save settings: {e:#}");
+            }
+        }
+        self.config_dirty = false;
+    }
+}
+
+impl eframe::App for Sort4Print {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Distinguishes "never got as far as painting" from "painted, but you
+        // are looking at an empty window".
+        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+        FIRST_FRAME.call_once(|| {
+            crate::diagnostics::log(&format!(
+                "first frame, available area {:?}",
+                ui.available_size()
+            ));
+            // Something is on screen, so start-up is over: from here a panic is
+            // a real fault and should be put in front of the user rather than
+            // treated as a backend that needs retrying.
+            crate::diagnostics::mark_running();
+        });
+
+        let ctx = ui.ctx().clone();
+
+        self.prefetch.poll();
+        self.poll_export();
+        self.handle_keys(&ctx);
+        self.schedule_prefetch();
+
+        // Panels claim their edges in this order; the editor takes whatever is
+        // left, so it has to come last.
+        crate::ui::toolbar::show(self, ui);
+        crate::ui::status_bar::show(self, ui);
+        crate::ui::filmstrip::show(self, ui);
+        if self.show_settings {
+            crate::ui::settings::show(self, ui);
+        }
+        crate::ui::editor::show(self, ui);
+
+        // Both files are written once a gesture has finished rather than on
+        // every frame of one, so a crop drag or a slider sweep is a single
+        // write and not a hundred. Waiting for a clean exit is not enough:
+        // settings should survive the program being killed too.
+        let holding_something = self.drag.is_some() || ctx.input(|i| i.pointer.any_down());
+        if !holding_something {
+            self.save_notes();
+            if self.config_dirty {
+                self.save_config();
+            }
+        }
+
+        // An export in flight repaints so its progress moves; otherwise the
+        // window sleeps until something happens.
+        if self.export_run.as_ref().map(|r| r.running).unwrap_or(false) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::diagnostics::log("closing; writing settings and notes");
+        // Rebuild the notes from what is actually on screen rather than
+        // trusting that every control remembered to report its change. The
+        // incremental path is the fast one; this is the one that has to be
+        // right, and it only runs once.
+        self.notes_changed_everywhere();
+        self.config_dirty = true;
+        self.save_config();
+        self.save_notes();
+    }
+}
+
+fn upload(ctx: &egui::Context, name: &str, rgba: &image::RgbaImage) -> egui::TextureHandle {
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+}
+
+/// Reads just the header to learn an image's upright dimensions, without
+/// decoding it. Used for pictures exported without ever being opened.
+fn image_size(path: &Path) -> anyhow::Result<(u32, u32)> {
+    let meta = sort4print_core::exif_data::read_meta(path);
+    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let (w, h) = reader.into_dimensions()?;
+    Ok(if meta.orientation.swaps_axes() {
+        (h, w)
+    } else {
+        (w, h)
+    })
+}

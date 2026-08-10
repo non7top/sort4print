@@ -1,0 +1,18 @@
+services:
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Match the host user so bind-mounted writes never land as root.
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    working_dir: /work
+    volumes:
+      - .:/work
+      - cargo-registry:/cache/cargo
+      - cargo-target:/cache/target
+      - xwin-cache:/cache/xwin
+
+volumes:
+  cargo-registry:
+  cargo-target:
+  xwin-cache:
