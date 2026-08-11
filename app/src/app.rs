@@ -32,6 +32,12 @@ pub struct Entry {
     /// What you call this particular spot — "Chinatown". Stays with the photo,
     /// including across restarts via the folder's notes file.
     pub description: Option<String>,
+    /// True once the crop has actually been moved. Merely opening a photo gives
+    /// it the default centred window, and that is not worth recording: it is
+    /// recomputed identically next time, and writing one for every photo walked
+    /// past is what made the notes file grow with the folder rather than with
+    /// the work done.
+    pub crop_adjusted: bool,
     pub exported: bool,
 }
 
@@ -44,6 +50,7 @@ impl Entry {
             city_override: None,
             country_override: None,
             description: None,
+            crop_adjusted: false,
             exported: false,
         }
     }
@@ -51,7 +58,7 @@ impl Entry {
     fn to_state(&self) -> PhotoState {
         PhotoState {
             selected: self.selected,
-            crop: self.crop,
+            crop: if self.crop_adjusted { self.crop } else { None },
             city: self.city_override.clone(),
             country: self.country_override.clone(),
             description: self.description.clone(),
@@ -61,6 +68,8 @@ impl Entry {
     fn apply_state(&mut self, state: &PhotoState) {
         self.selected = state.selected;
         self.crop = state.crop;
+        // A crop that came back from the notes was deliberate by definition.
+        self.crop_adjusted = state.crop.is_some();
         self.city_override = state.city.clone();
         self.country_override = state.country.clone();
         self.description = state.description.clone();
@@ -100,8 +109,17 @@ struct Keys {
 
 pub struct DragState {
     pub handle: Handle,
-    /// Pointer position at the last frame, in original-image pixels.
-    pub last: (f64, f64),
+    /// Where the pointer went down, in original-image pixels.
+    pub start_pointer: (f64, f64),
+    /// The window as it was when the drag began.
+    ///
+    /// A move is computed from these two every frame, rather than by adding
+    /// this frame's pointer delta to the window's current position. That
+    /// distinction is the whole difference between magnetism and glue: applying
+    /// deltas to an already-snapped box means each small movement is undone by
+    /// the snap that follows it, and the window can never leave an edge unless
+    /// the pointer jumps past the snap radius within a single frame.
+    pub start_box: CropBox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +129,27 @@ pub enum SettingsTab {
     Output,
     Performance,
     About,
+}
+
+/// A pass over the whole folder that fills the disk cache.
+///
+/// Deliberately a slow feed rather than one enormous queue: jobs are handed out
+/// only as earlier ones finish, so the queue stays short, the photo actually
+/// being looked at is never stuck behind the scan, and nothing has to be dropped
+/// to keep the backlog bounded.
+pub struct ScanAll {
+    pub next: usize,
+    pub total: usize,
+}
+
+impl ScanAll {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            1.0
+        } else {
+            self.next as f32 / self.total as f32
+        }
+    }
 }
 
 pub enum ExportMsg {
@@ -183,9 +222,24 @@ pub struct Sort4Print {
     pub export_run: Option<ExportRun>,
     /// Free-text city search box in the location panel.
     pub place_search: String,
+    pub disk_cache: Option<sort4print_core::cache::DiskCache>,
+    /// Long side of the editor area in real screen pixels, measured each frame.
+    /// A laptop panel and an external monitor want different preview sizes, and
+    /// this is how that gets noticed rather than guessed.
+    pub editor_long_px: u32,
+    /// A run through the whole folder filling the cache, so browsing afterwards
+    /// waits for nothing. Holds the next index to queue.
+    pub scan_all: Option<ScanAll>,
     /// Per-photo choices for the open folder, mirrored to a notes file there.
     notes: Sidecar,
     notes_dirty: bool,
+    /// Set when the folder holds notes that could not be read. Saving is then
+    /// refused for that folder, so an unreadable file is never replaced by an
+    /// empty one.
+    notes_blocked: bool,
+    /// When the notes were last written, so a busy session does not rewrite a
+    /// large file on every frame.
+    last_notes_write: Option<std::time::Instant>,
 }
 
 impl Sort4Print {
@@ -230,9 +284,20 @@ impl Sort4Print {
             started.elapsed().as_millis()
         ));
 
+        let disk_cache = config.disk_cache();
+        crate::diagnostics::log(&match &disk_cache {
+            Some(cache) => format!(
+                "image cache: {} ({} MB budget)",
+                cache.root().display(),
+                cache.budget_bytes() / (1024 * 1024)
+            ),
+            None => "image cache: off".to_string(),
+        });
+
         let prefetch = Prefetcher::new(
             config.prefetch.workers,
             config.prefetch.cache,
+            disk_cache.clone(),
             cc.egui_ctx.clone(),
         );
         let config_ratio_text = config.ratio.to_config_string();
@@ -257,11 +322,16 @@ impl Sort4Print {
             scroll_to_current: false,
             notes: Sidecar::default(),
             notes_dirty: false,
+            notes_blocked: false,
+            last_notes_write: None,
             show_settings: true,
             settings_tab: SettingsTab::Caption,
             status: String::new(),
             export_run: None,
             place_search: String::new(),
+            disk_cache,
+            editor_long_px: 0,
+            scan_all: None,
             config_path,
             config_dirty: false,
             config,
@@ -279,21 +349,39 @@ impl Sort4Print {
 
     pub fn open_folder(&mut self, dir: &Path) {
         // Whatever was decided about the folder being left behind.
-        self.save_notes();
+        self.save_notes_now();
 
         match loader::scan_folder(dir) {
             Ok(files) => {
-                let notes_path = Sidecar::path_for(dir);
-                let notes = Sidecar::load(dir);
+                let report = Sidecar::load_detailed(dir);
+                let notes = report.sidecar;
                 let restored = notes.len();
                 crate::diagnostics::log(&format!(
-                    "notes: {} ({}), {restored} photo(s) described",
-                    notes_path.display(),
-                    match std::fs::metadata(&notes_path) {
-                        Ok(meta) => format!("{} bytes", meta.len()),
-                        Err(_) => "no such file".to_string(),
+                    "notes: read {} photo(s) from {}{}",
+                    restored,
+                    report
+                        .source
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "nothing (no notes yet)".into()),
+                    if report.incomplete {
+                        " — no end marker, so written by an older version or cut short"
+                    } else {
+                        ""
                     }
                 ));
+
+                // A notes file we cannot make sense of must not be written
+                // over: whatever it holds is unknown, and guessing cost a
+                // folder's worth of decisions once already.
+                self.notes_blocked = report.unreadable_file_present;
+                if self.notes_blocked {
+                    let path = Sidecar::path_for(dir);
+                    crate::diagnostics::log(&format!(
+                        "refusing to write notes: {} exists but could not be read",
+                        path.display()
+                    ));
+                }
 
                 // Notes are matched to photos by file name. Counting the
                 // matches separately from the entries read is what would tell
@@ -316,9 +404,33 @@ impl Sort4Print {
                         "{matched} of {restored} note(s) matched a photo in the folder"
                     ));
                 }
+
+                // Back to the photo that was on screen last. If that file has
+                // since gone, its old position puts you near where you were
+                // rather than back at the start of the folder.
+                self.current = notes
+                    .last_file
+                    .as_deref()
+                    .and_then(|wanted| {
+                        self.entries.iter().position(|e| e.file_name() == wanted)
+                    })
+                    .or_else(|| {
+                        notes
+                            .last_index
+                            .map(|i| i.min(self.entries.len().saturating_sub(1)))
+                    })
+                    .unwrap_or(0);
+                if self.current > 0 {
+                    self.scroll_to_current = true;
+                    crate::diagnostics::log(&format!(
+                        "resuming at {} of {}",
+                        self.current + 1,
+                        self.entries.len()
+                    ));
+                }
+
                 self.notes = notes;
                 self.notes_dirty = false;
-                self.current = 0;
                 self.reset_view();
                 self.clear_image_caches();
                 self.config.source_dir = Some(dir.to_path_buf());
@@ -359,13 +471,42 @@ impl Sort4Print {
         }
     }
 
+    /// Writes the notes if they have changed and enough time has passed.
+    ///
+    /// The throttle exists because a folder of eleven thousand photos makes the
+    /// notes big enough that writing them on every frame of a crop drag would
+    /// be real work. Anything that must not be lost calls `save_notes_now`.
     pub fn save_notes(&mut self) {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
         if !self.notes_dirty {
+            return;
+        }
+        if let Some(last) = self.last_notes_write {
+            if last.elapsed() < MIN_INTERVAL {
+                return;
+            }
+        }
+        self.save_notes_now();
+    }
+
+    pub fn save_notes_now(&mut self) {
+        if !self.notes_dirty {
+            return;
+        }
+        if self.notes_blocked {
+            self.status =
+                "Existing notes in this folder could not be read; not writing over them.".into();
             return;
         }
         let Some(dir) = self.config.source_dir.clone() else {
             return;
         };
+
+        // Where you were is part of the notes, and is only ever needed at the
+        // moment of writing them.
+        self.notes.last_file = self.current_entry().map(Entry::file_name);
+        self.notes.last_index = Some(self.current);
+        self.last_notes_write = Some(std::time::Instant::now());
         let path = sort4print_core::sidecar::Sidecar::path_for(&dir);
         match self.notes.save(&dir) {
             Ok(()) => {
@@ -439,6 +580,9 @@ impl Sort4Print {
                 // The list has to follow, or the picture being edited scrolls
                 // out of sight after a few steps.
                 self.scroll_to_current = true;
+                // Where you got to is worth keeping, but only worth writing at
+                // the throttled rate — hence dirty rather than an immediate save.
+                self.notes_dirty = true;
                 return;
             }
         }
@@ -459,7 +603,7 @@ impl Sort4Print {
         if self.entries.is_empty() {
             return;
         }
-        let max_px = self.config.preview_max_px;
+        let max_px = self.preview_target_px();
         let ahead = self.config.prefetch.ahead as isize;
         let behind = self.config.prefetch.behind as isize;
         let len = self.entries.len() as isize;
@@ -481,6 +625,73 @@ impl Sort4Print {
             let path = self.entries[index as usize].path.clone();
             self.prefetch
                 .request(&path, JobKind::Preview, max_px, priority);
+        }
+    }
+
+    /// Starts a pass over the whole folder, filling the cache so that browsing
+    /// afterwards waits for nothing.
+    pub fn start_scan_all(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.scan_all = Some(ScanAll {
+            next: 0,
+            total: self.entries.len(),
+        });
+        self.status = format!("Reading all {} pictures…", self.entries.len());
+        crate::diagnostics::log(&format!("scan of {} pictures started", self.entries.len()));
+    }
+
+    pub fn stop_scan_all(&mut self) {
+        if self.scan_all.take().is_some() {
+            self.status = "Stopped reading.".into();
+        }
+    }
+
+    /// Hands out a few more of the scan's photos when the workers have room.
+    fn pump_scan_all(&mut self) {
+        // Small enough that the queue never builds up, large enough to keep
+        // every worker busy.
+        const IN_FLIGHT: usize = 24;
+
+        let Some(scan) = self.scan_all.as_ref() else {
+            return;
+        };
+        let (mut next, total) = (scan.next, scan.total);
+        let max_px = self.preview_target_px();
+
+        while self.prefetch.queued() < IN_FLIGHT && next < total {
+            let Some(entry) = self.entries.get(next) else {
+                break;
+            };
+            let path = entry.path.clone();
+            next += 1;
+            // Far behind anything the user is waiting on.
+            self.prefetch.request(&path, JobKind::Thumb, 220, 50_000);
+            self.prefetch
+                .request(&path, JobKind::Preview, max_px, 60_000);
+        }
+
+        let finished = next >= total && self.prefetch.queued() == 0;
+        if let Some(scan) = self.scan_all.as_mut() {
+            scan.next = next;
+        }
+        if finished {
+            self.scan_all = None;
+            let freed = self.disk_cache.as_ref().map(|c| c.prune()).unwrap_or(0);
+            self.status = match self.disk_cache.as_ref() {
+                Some(cache) => format!(
+                    "Read all {total} pictures — cache now {} MB{}",
+                    cache.total_bytes() / (1024 * 1024),
+                    if freed > 0 {
+                        format!(", {} MB dropped to stay in budget", freed / (1024 * 1024))
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => format!("Read all {total} pictures (cache is off)"),
+            };
+            crate::diagnostics::log(&self.status.clone());
         }
     }
 
@@ -537,6 +748,20 @@ impl Sort4Print {
         handle
     }
 
+    /// The size previews are decoded and cached at.
+    ///
+    /// Follows the editor area, rounded up to one of a handful of buckets and
+    /// capped by the setting. Bucketing is what keeps this from making a new
+    /// cache entry for every width the window has ever had, while still giving a
+    /// laptop panel and a large monitor each a size that suits them.
+    pub fn preview_target_px(&self) -> u32 {
+        let cap = self.config.preview_max_px;
+        if self.editor_long_px == 0 {
+            return cap;
+        }
+        sort4print_core::cache::DiskCache::bucket_for(self.editor_long_px, cap)
+    }
+
     /// Drops decoded images and their textures together. Anything that changes
     /// what a preview should look like has to clear both, or the old textures
     /// stay on screen at the wrong size.
@@ -587,6 +812,8 @@ impl Sort4Print {
         let changed = match self.entries.get_mut(index) {
             Some(entry) if entry.crop != Some(crop) => {
                 entry.crop = Some(crop);
+                // This came from a gesture, so it is worth remembering.
+                entry.crop_adjusted = true;
                 true
             }
             _ => false,
@@ -599,6 +826,7 @@ impl Sort4Print {
     pub fn reset_crop(&mut self, index: usize) {
         if let Some(entry) = self.entries.get_mut(index) {
             entry.crop = None;
+            entry.crop_adjusted = false;
         }
         self.note_changed(index);
     }
@@ -785,7 +1013,7 @@ impl Sort4Print {
         // before a long job starts rather than after it, and rebuild them from
         // the entries so nothing missed by the incremental path is lost.
         self.notes_changed_everywhere();
-        self.save_notes();
+        self.save_notes_now();
 
         self.export_run = Some(ExportRun {
             rx,
@@ -956,6 +1184,7 @@ impl eframe::App for Sort4Print {
         self.poll_export();
         self.handle_keys(&ctx);
         self.schedule_prefetch();
+        self.pump_scan_all();
 
         // Panels claim their edges in this order; the editor takes whatever is
         // left, so it has to come last.
@@ -979,9 +1208,11 @@ impl eframe::App for Sort4Print {
             }
         }
 
-        // An export in flight repaints so its progress moves; otherwise the
-        // window sleeps until something happens.
-        if self.export_run.as_ref().map(|r| r.running).unwrap_or(false) {
+        // Work in flight repaints so its progress moves; otherwise the window
+        // sleeps until something happens.
+        let busy = self.export_run.as_ref().map(|r| r.running).unwrap_or(false)
+            || self.scan_all.is_some();
+        if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
     }
@@ -995,7 +1226,7 @@ impl eframe::App for Sort4Print {
         self.notes_changed_everywhere();
         self.config_dirty = true;
         self.save_config();
-        self.save_notes();
+        self.save_notes_now();
     }
 }
 

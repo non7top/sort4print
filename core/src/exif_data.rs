@@ -176,6 +176,91 @@ fn extract_app1(bytes: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// The small JPEG most cameras embed in the EXIF block.
+///
+/// This is the difference between a filmstrip that scrolls and one that does
+/// not: reading a 160×120 preview already sitting in the file costs a fraction
+/// of a millisecond, where decoding the twelve-megapixel original to produce the
+/// same postage stamp costs a hundred of them and a core to do it on.
+pub fn read_exif_thumbnail(path: &Path) -> Option<Vec<u8>> {
+    thumbnail_from_app1(&read_exif_app1(path)?)
+}
+
+fn thumbnail_from_app1(app1: &[u8]) -> Option<Vec<u8>> {
+    let tiff = app1.get(EXIF_HEADER.len()..)?;
+    let reader = TiffReader::new(tiff)?;
+
+    // The thumbnail lives in the second directory, whose offset is the "next"
+    // pointer sitting after the first directory's entries.
+    let ifd0 = reader.u32(4)? as usize;
+    let entry_count = reader.u16(ifd0)? as usize;
+    let ifd1 = reader.u32(ifd0 + 2 + entry_count * 12)? as usize;
+    if ifd1 == 0 {
+        return None;
+    }
+
+    let mut offset = None;
+    let mut length = None;
+    for i in 0..reader.u16(ifd1)? as usize {
+        let entry = ifd1 + 2 + i * 12;
+        let value = reader.inline_value(entry)?;
+        match reader.u16(entry)? {
+            0x0201 => offset = Some(value as usize),
+            0x0202 => length = Some(value as usize),
+            _ => {}
+        }
+    }
+
+    let bytes = tiff.get(offset?..offset?.checked_add(length?)?)?;
+    // Only worth having if it really is a JPEG.
+    bytes.starts_with(&[0xFF, 0xD8]).then(|| bytes.to_vec())
+}
+
+/// Just enough TIFF to find things in an EXIF block.
+struct TiffReader<'a> {
+    bytes: &'a [u8],
+    big_endian: bool,
+}
+
+impl<'a> TiffReader<'a> {
+    fn new(bytes: &'a [u8]) -> Option<TiffReader<'a>> {
+        let big_endian = match bytes.get(..2)? {
+            b"MM" => true,
+            b"II" => false,
+            _ => return None,
+        };
+        let reader = TiffReader { bytes, big_endian };
+        (reader.u16(2)? == 42).then_some(reader)
+    }
+
+    fn u16(&self, at: usize) -> Option<u16> {
+        let raw: [u8; 2] = self.bytes.get(at..at + 2)?.try_into().ok()?;
+        Some(if self.big_endian {
+            u16::from_be_bytes(raw)
+        } else {
+            u16::from_le_bytes(raw)
+        })
+    }
+
+    fn u32(&self, at: usize) -> Option<u32> {
+        let raw: [u8; 4] = self.bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(if self.big_endian {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
+    }
+
+    /// The value of a single-item entry, which TIFF stores in the entry itself.
+    /// A SHORT occupies the first two of those four bytes.
+    fn inline_value(&self, entry: usize) -> Option<u32> {
+        match self.u16(entry + 2)? {
+            3 => self.u16(entry + 8).map(u32::from),
+            _ => self.u32(entry + 8),
+        }
+    }
+}
+
 /// Rewrites the orientation tag inside an APP1 payload to 1 ("normal").
 ///
 /// Returns false when the tag is absent or the block is not walkable, which is
@@ -375,6 +460,65 @@ mod tests {
     #[test]
     fn insert_rejects_non_jpeg_input() {
         assert!(insert_app1(b"not a jpeg", &[1, 2, 3]).is_err());
+    }
+
+    /// Little-endian EXIF block with an empty IFD0 and an IFD1 pointing at a
+    /// stub JPEG, which is the shape every camera writes.
+    fn app1_with_thumbnail(thumbnail: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_HEADER);
+        v.extend_from_slice(b"II");
+        v.extend_from_slice(&42u16.to_le_bytes());
+        v.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at 8
+
+        // IFD0: no entries, next directory at 8 + 2 + 4 = 14.
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&14u32.to_le_bytes());
+
+        // IFD1 at 14: two entries, then the next pointer, then the image.
+        let thumbnail_at = 14 + 2 + 2 * 12 + 4;
+        v.extend_from_slice(&2u16.to_le_bytes());
+        for (tag, value) in [(0x0201u16, thumbnail_at as u32), (0x0202, thumbnail.len() as u32)] {
+            v.extend_from_slice(&tag.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes()); // type LONG
+            v.extend_from_slice(&1u32.to_le_bytes()); // count
+            v.extend_from_slice(&value.to_le_bytes());
+        }
+        v.extend_from_slice(&0u32.to_le_bytes()); // no further directory
+        v.extend_from_slice(thumbnail);
+        v
+    }
+
+    #[test]
+    fn the_embedded_thumbnail_is_found() {
+        let stub = [0xFF, 0xD8, 0xAA, 0xBB, 0xFF, 0xD9];
+        let app1 = app1_with_thumbnail(&stub);
+        assert_eq!(thumbnail_from_app1(&app1).as_deref(), Some(&stub[..]));
+    }
+
+    #[test]
+    fn a_block_with_no_second_directory_has_no_thumbnail() {
+        // The orientation-only block has IFD0 and nothing after it.
+        let mut app1 = app1_with_orientation(1);
+        assert!(thumbnail_from_app1(&app1).is_none());
+        assert!(normalize_orientation(&mut app1), "and is still walkable");
+    }
+
+    #[test]
+    fn a_thumbnail_that_is_not_a_jpeg_is_refused() {
+        let app1 = app1_with_thumbnail(&[0x00, 0x01, 0x02, 0x03]);
+        assert!(thumbnail_from_app1(&app1).is_none());
+    }
+
+    #[test]
+    fn thumbnail_extraction_declines_garbage_without_panicking() {
+        assert!(thumbnail_from_app1(&[]).is_none());
+        assert!(thumbnail_from_app1(b"Exif\0\0II").is_none());
+        assert!(thumbnail_from_app1(b"Exif\0\0XX*\0\0\0\0\0").is_none());
+        // A length that runs off the end of the block.
+        let mut app1 = app1_with_thumbnail(&[0xFF, 0xD8, 0xFF, 0xD9]);
+        app1.truncate(app1.len() - 2);
+        assert!(thumbnail_from_app1(&app1).is_none());
     }
 
     #[test]

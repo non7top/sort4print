@@ -277,6 +277,30 @@ impl Default for PrefetchConfig {
     }
 }
 
+/// The on-disk cache of already-decoded previews and thumbnails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    /// Empty means the standard per-user cache location.
+    pub directory: Option<PathBuf>,
+    pub budget_mb: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            enabled: true,
+            directory: None,
+            // A view-sized preview is a fraction of the megabytes its original
+            // takes, and a thumbnail a rounding error, so this holds a folder of
+            // ten thousand or more outright. Generous on purpose: everything in
+            // here is rebuildable, and running out is the only failure mode that
+            // costs the user time.
+            budget_mb: 4096,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub source_dir: Option<PathBuf>,
@@ -300,7 +324,12 @@ pub struct Config {
     pub prefetch: PrefetchConfig,
     /// Long side of the preview the editor works on. The export always re-reads
     /// the original at full resolution.
+    ///
+    /// Deliberately a fixed setting rather than the window's current size: the
+    /// cache is keyed on the photo, not on the window, and following the window
+    /// would throw the whole cache away every time it was resized.
     pub preview_max_px: u32,
+    pub cache: CacheConfig,
 }
 
 impl Default for Config {
@@ -322,6 +351,7 @@ impl Default for Config {
             // Comfortably sharper than any editor viewport, while keeping the
             // per-step texture upload small enough not to be felt.
             preview_max_px: 1800,
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -453,7 +483,34 @@ impl Config {
                 .get_parsed::<u32>("view", "preview_max_px")
                 .map(|v| v.clamp(600, 8000))
                 .unwrap_or(d.preview_max_px),
+            cache: CacheConfig {
+                enabled: ini.get_bool("cache", "enabled", d.cache.enabled),
+                directory: ini
+                    .get("cache", "directory")
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from),
+                budget_mb: ini
+                    .get_parsed::<u64>("cache", "budget_mb")
+                    .map(|v| v.clamp(64, 200_000))
+                    .unwrap_or(d.cache.budget_mb),
+            },
         }
+    }
+
+    /// Where decoded previews are kept, and how much room they get.
+    pub fn disk_cache(&self) -> Option<crate::cache::DiskCache> {
+        if !self.cache.enabled {
+            return None;
+        }
+        let root = self
+            .cache
+            .directory
+            .clone()
+            .unwrap_or_else(crate::cache::DiskCache::default_root);
+        Some(crate::cache::DiskCache::new(
+            root,
+            self.cache.budget_mb.saturating_mul(1024 * 1024),
+        ))
     }
 
     pub fn to_ini(&self) -> Ini {
@@ -502,6 +559,19 @@ impl Config {
         ini.set("prefetch", "behind", &p.behind.to_string());
         ini.set("prefetch", "workers", &p.workers.to_string());
         ini.set("prefetch", "cache", &p.cache.to_string());
+
+        ini.set("cache", "enabled", bool_str(self.cache.enabled));
+        ini.set(
+            "cache",
+            "directory",
+            &self
+                .cache
+                .directory
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        ini.set("cache", "budget_mb", &self.cache.budget_mb.to_string());
 
         // Only user-defined locales are written back; re-emitting the built-ins
         // would bloat the file and freeze them against future corrections.
@@ -597,6 +667,15 @@ fn comment_for(section: &str, key: &str) -> Option<String> {
         }
         ("prefetch", "workers") => "0 picks a sensible number from the CPU count.",
         ("prefetch", "cache") => "How many decoded previews stay in memory.",
+        ("cache", "enabled") => {
+            "Keep decoded previews and thumbnails on disk, so a folder visited\n\
+             a second time opens without decoding anything again. Everything in\n\
+             there can be rebuilt from the photos; deleting it costs only time."
+        }
+        ("cache", "directory") => "Empty means the standard per-user cache location.",
+        ("cache", "budget_mb") => {
+            "Upper limit on the cache. Least recently used entries go first."
+        }
         _ => return None,
     };
     Some(text.to_string())

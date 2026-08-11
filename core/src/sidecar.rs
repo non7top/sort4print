@@ -19,10 +19,26 @@ use crate::ini::Ini;
 
 pub const FILE_NAME: &str = "sort4print-notes.ini";
 
+/// Previous copy, kept so a half-written file is not the only one there is.
+pub const BACKUP_SUFFIX: &str = ".bak";
+/// Written last. Its absence is how a truncated file is recognised.
+const END_MARKER: &str = "# end";
+
+/// Holds where you were, rather than anything about one photo. The name cannot
+/// collide with a photo's: every picture the scanner accepts has an image
+/// extension, and this has none.
+const SESSION_SECTION: &str = "sort4print";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PhotoState {
     pub selected: bool,
     /// In original-image pixels, upright.
+    ///
+    /// Only ever set for a crop that was actually moved. Merely looking at a
+    /// photo gives it the default centred window, and recording that for every
+    /// picture walked past is what made this file grow into six figures for a
+    /// folder of a couple of thousand — while also meaning a photo you never
+    /// touched came back with remembered framing instead of a fresh fit.
     pub crop: Option<CropBox>,
     pub city: Option<String>,
     pub country: Option<String>,
@@ -41,9 +57,35 @@ impl PhotoState {
     }
 }
 
+/// What a read of the notes produced, and how much to trust it.
+#[derive(Debug, Clone, Default)]
+pub struct LoadResult {
+    pub sidecar: Sidecar,
+    /// Which of the two files was used.
+    pub source: Option<PathBuf>,
+    /// It was missing its end marker: either an unfinished write or a file from
+    /// a version that predates the marker. Used anyway, and worth logging.
+    pub incomplete: bool,
+    /// A file is present and has bytes in it, but nothing could be made of it.
+    /// Whatever it holds is unknown, so it must not be written over.
+    pub unreadable_file_present: bool,
+}
+
+struct Candidate {
+    sidecar: Sidecar,
+    path: PathBuf,
+    complete: bool,
+    richness: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Sidecar {
     entries: BTreeMap<String, PhotoState>,
+    /// The photo that was on screen last, so reopening the folder returns to it.
+    pub last_file: Option<String>,
+    /// Its position, used when that file is no longer in the folder: you land
+    /// roughly where you were rather than back at the beginning.
+    pub last_index: Option<usize>,
 }
 
 impl Sidecar {
@@ -51,19 +93,105 @@ impl Sidecar {
         folder.join(FILE_NAME)
     }
 
-    /// A missing or unreadable file simply means "no notes yet".
+    pub fn backup_path_for(folder: &Path) -> PathBuf {
+        folder.join(format!("{FILE_NAME}{BACKUP_SUFFIX}"))
+    }
+
+    /// Reads the notes, choosing the better of the file and its backup.
     pub fn load(folder: &Path) -> Sidecar {
-        let path = Sidecar::path_for(folder);
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Sidecar::default();
+        Sidecar::load_detailed(folder).sidecar
+    }
+
+    /// Reads the notes and says where they came from.
+    ///
+    /// The rule is *never discard what you cannot read*. A missing end marker
+    /// makes a file suspect, not worthless — it is also exactly what a file
+    /// written by an older version looks like, and treating that as corruption
+    /// is how a folder's worth of decisions got thrown away once already. So
+    /// both copies are parsed and the better one wins: complete beats
+    /// incomplete, and failing that, more decisions beat fewer.
+    ///
+    /// If neither yields anything usable while a file is nonetheless sitting
+    /// there with bytes in it, that is reported rather than papered over: the
+    /// caller must not write over something it could not understand.
+    pub fn load_detailed(folder: &Path) -> LoadResult {
+        let main_path = Sidecar::path_for(folder);
+        let backup_path = Sidecar::backup_path_for(folder);
+
+        let main = Sidecar::read_candidate(&main_path);
+        let backup = Sidecar::read_candidate(&backup_path);
+
+        // Spelled out rather than scored, because the order matters and each
+        // case means something different:
+        let best = match (main, backup) {
+            // The live file finished being written, so it is authoritative --
+            // including when it holds fewer decisions than the backup, which is
+            // what deliberately clearing them looks like.
+            (Some(main), _) if main.complete => Some(main),
+            // The live file was cut short but the backup is intact: this is the
+            // case the backup exists for.
+            (Some(_), Some(backup)) if backup.complete => Some(backup),
+            // Neither carries a marker, so both predate it or both were cut
+            // short. Nothing to go on but which knows more.
+            (Some(main), Some(backup)) => Some(if backup.richness > main.richness {
+                backup
+            } else {
+                main
+            }),
+            (Some(main), None) => Some(main),
+            (None, Some(backup)) => Some(backup),
+            (None, None) => None,
         };
-        Sidecar::from_ini(&Ini::parse(&text))
+
+        match best {
+            Some(candidate) => LoadResult {
+                sidecar: candidate.sidecar,
+                source: Some(candidate.path),
+                incomplete: !candidate.complete,
+                unreadable_file_present: false,
+            },
+            None => {
+                // Nothing usable. Was there something there at all?
+                let has_bytes = [&main_path, &backup_path].into_iter().any(|p| {
+                    std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+                });
+                LoadResult {
+                    sidecar: Sidecar::default(),
+                    source: None,
+                    incomplete: false,
+                    unreadable_file_present: has_bytes,
+                }
+            }
+        }
+    }
+
+    /// `None` when the file is absent, unreadable, or says nothing at all.
+    fn read_candidate(path: &Path) -> Option<Candidate> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let complete = text.lines().any(|line| line.trim() == END_MARKER);
+        let sidecar = Sidecar::from_ini(&Ini::parse(&text));
+        // A file that parses to nothing is no better than no file.
+        if sidecar.entries.is_empty() && sidecar.last_file.is_none() {
+            return None;
+        }
+        Some(Candidate {
+            richness: sidecar.entries.len(),
+            complete,
+            sidecar,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn from_ini(ini: &Ini) -> Sidecar {
         let mut entries = BTreeMap::new();
+        let mut sidecar = Sidecar::default();
         for section in ini.section_names() {
             if section.is_empty() {
+                continue;
+            }
+            if section == SESSION_SECTION {
+                sidecar.last_file = non_empty(ini.get(section, "last_file"));
+                sidecar.last_index = ini.get_parsed::<usize>(section, "last_index");
                 continue;
             }
             let state = PhotoState {
@@ -77,11 +205,20 @@ impl Sidecar {
                 entries.insert(section.to_string(), state);
             }
         }
-        Sidecar { entries }
+        sidecar.entries = entries;
+        sidecar
     }
 
     pub fn to_ini(&self) -> Ini {
         let mut ini = Ini::new();
+
+        if let Some(last) = &self.last_file {
+            ini.set(SESSION_SECTION, "last_file", last);
+            if let Some(index) = self.last_index {
+                ini.set(SESSION_SECTION, "last_index", &index.to_string());
+            }
+        }
+
         for (name, state) in &self.entries {
             if state.is_empty() {
                 continue;
@@ -105,26 +242,57 @@ impl Sidecar {
         ini
     }
 
-    /// Writes the notes, or deletes the file when there is nothing left to say.
+    /// Writes the notes, or removes them when there is nothing left to say.
+    ///
+    /// Never writes over the live file in place. The new copy is written
+    /// alongside, flushed to the disk, and only then moved into position, with
+    /// the previous copy kept as `.bak`. A crash or a full disk can therefore
+    /// leave a stray temporary file, but never a half-written set of notes and
+    /// nothing else — and the end marker means a truncated file is recognised
+    /// as one rather than read as a shorter set of decisions.
     pub fn save(&self, folder: &Path) -> Result<()> {
         let path = Sidecar::path_for(folder);
-        if self.entries.values().all(PhotoState::is_empty) {
-            if path.exists() {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("removing {}", path.display()))?;
+        let backup = Sidecar::backup_path_for(folder);
+
+        if self.is_empty() && self.last_file.is_none() {
+            for stale in [&path, &backup] {
+                if stale.exists() {
+                    std::fs::remove_file(stale)
+                        .with_context(|| format!("removing {}", stale.display()))?;
+                }
             }
             return Ok(());
         }
 
         let header = "\
 # Notes made by sort4print about the photos in this folder: which are picked,
-# how each is cropped, and what you called the place.
+# how each is cropped, and what you called the place. Only choices you actually
+# made are in here, so its size follows the work done rather than the number of
+# photos in the folder.
 #
 # Sections are file names. Deleting this file discards those choices and
 # nothing else; the photos are untouched.
 ";
-        let body = format!("{header}\n{}", self.to_ini());
-        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))
+        let body = format!("{header}\n{}\n{END_MARKER}\n", self.to_ini());
+
+        let temporary = folder.join(format!("{FILE_NAME}.writing"));
+        write_and_sync(&temporary, body.as_bytes())
+            .with_context(|| format!("writing {}", temporary.display()))?;
+
+        // Copying rather than moving the old file means that if the rename
+        // below fails, the original is still where the reader looks for it.
+        if path.exists() {
+            std::fs::copy(&path, &backup)
+                .with_context(|| format!("backing up to {}", backup.display()))?;
+        }
+
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("moving the new notes into {}", path.display()))
+    }
+
+    /// Roughly what the notes take on disk, for reporting.
+    pub fn approximate_bytes(&self) -> usize {
+        self.to_ini().to_string().len()
     }
 
     pub fn get(&self, file_name: &str) -> Option<&PhotoState> {
@@ -155,9 +323,27 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Writes to a fresh file and gets it onto the disk before returning, so the
+/// rename that follows is swapping in something complete.
+fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
 fn format_crop(c: CropBox) -> String {
-    // One decimal is well below a pixel of framing and keeps the file readable.
-    format!("{:.1},{:.1},{:.1},{:.1}", c.x, c.y, c.w, c.h)
+    // Whole pixels: the export rounds to them anyway, and four short integers
+    // instead of four decimals is a third off the size of the busiest line.
+    format!(
+        "{},{},{},{}",
+        c.x.round() as i64,
+        c.y.round() as i64,
+        c.w.round().max(1.0) as i64,
+        c.h.round().max(1.0) as i64
+    )
 }
 
 fn parse_crop(text: &str) -> Option<CropBox> {
@@ -210,9 +396,13 @@ mod tests {
         assert!(first.selected);
         assert_eq!(first.description.as_deref(), Some("Chinatown"));
         assert_eq!(first.city.as_deref(), Some("San Francisco"));
+        // Crops are stored as whole pixels, so a half-pixel in goes to the
+        // nearest one out. That is deliberate: the export rounds to pixels
+        // anyway, and integers keep the busiest line in the file short.
         let crop = first.crop.unwrap();
-        assert!((crop.x - 100.0).abs() < 0.05 && (crop.y - 200.5).abs() < 0.05);
-        assert!((crop.w - 2000.0).abs() < 0.05 && (crop.h - 3000.0).abs() < 0.05);
+        assert!((crop.x - 100.0).abs() <= 0.5, "x = {}", crop.x);
+        assert!((crop.y - 201.0).abs() <= 0.5, "y = {}", crop.y);
+        assert!((crop.w - 2000.0).abs() <= 0.5 && (crop.h - 3000.0).abs() <= 0.5);
 
         let second = back.get("IMG_0002.JPG").unwrap();
         assert!(!second.selected);
@@ -272,20 +462,274 @@ mod tests {
         assert!(parse_crop("1,2,0,4").is_none());
     }
 
+    /// Each disk test gets its own directory so they can run concurrently.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sort4print-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn saving_and_loading_from_disk() {
-        let dir = std::env::temp_dir().join(format!("sort4print-sidecar-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("roundtrip");
 
         sample().save(&dir).unwrap();
         assert!(Sidecar::path_for(&dir).exists());
         let back = Sidecar::load(&dir);
         assert_eq!(back.len(), 2);
 
-        // Clearing everything removes the file rather than leaving a stub.
+        // Clearing everything removes the notes rather than leaving a stub.
         Sidecar::default().save(&dir).unwrap();
         assert!(!Sidecar::path_for(&dir).exists());
+        assert!(!Sidecar::backup_path_for(&dir).exists());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_previous_copy_is_kept_and_no_temporary_is_left_behind() {
+        let dir = scratch("backup");
+
+        sample().save(&dir).unwrap();
+        assert!(!Sidecar::backup_path_for(&dir).exists(), "nothing to back up yet");
+
+        let mut second = sample();
+        second.set(
+            "IMG_0009.JPG",
+            PhotoState {
+                selected: true,
+                ..Default::default()
+            },
+        );
+        second.save(&dir).unwrap();
+
+        assert!(Sidecar::backup_path_for(&dir).exists(), "previous copy kept");
+        assert_eq!(Sidecar::load(&dir).len(), 3);
+        assert!(
+            !dir.join(format!("{FILE_NAME}.writing")).exists(),
+            "the temporary file should have been moved, not left"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression that lost a folder's worth of work: a notes file written
+    /// before end markers existed has no marker, and rejecting it as corrupt
+    /// meant starting empty and then rotating the good file away.
+    #[test]
+    fn a_file_from_before_end_markers_is_still_read() {
+        let dir = scratch("legacy");
+
+        // Exactly what an older version wrote: no marker, no backup.
+        let legacy = "\
+# Notes made by sort4print about the photos in this folder.
+
+[IMG_0001.JPG]
+selected = true
+crop = 100.0,200.0,2000.0,3000.0
+description = Chinatown
+
+[IMG_0002.JPG]
+selected = true
+";
+        std::fs::write(Sidecar::path_for(&dir), legacy).unwrap();
+
+        let report = Sidecar::load_detailed(&dir);
+        assert_eq!(report.sidecar.len(), 2, "an older file must still be read");
+        assert!(report.incomplete, "and be recognised as marker-less");
+        assert!(!report.unreadable_file_present, "it was perfectly readable");
+        assert_eq!(
+            report.sidecar.get("IMG_0001.JPG").unwrap().description.as_deref(),
+            Some("Chinatown")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_complete_file_wins_even_when_the_backup_holds_more() {
+        let dir = scratch("deliberate-clear");
+
+        // A rich backup, and a complete live file with a single entry: that is
+        // what deliberately unpicking almost everything looks like, and the
+        // live file has to be believed.
+        let mut rich = Sidecar::default();
+        for i in 0..20 {
+            rich.set(
+                &format!("IMG_{i:04}.JPG"),
+                PhotoState {
+                    selected: true,
+                    ..Default::default()
+                },
+            );
+        }
+        std::fs::write(
+            Sidecar::backup_path_for(&dir),
+            format!("{}\n{END_MARKER}\n", rich.to_ini()),
+        )
+        .unwrap();
+
+        let mut lean = Sidecar::default();
+        lean.set(
+            "IMG_0000.JPG",
+            PhotoState {
+                selected: true,
+                ..Default::default()
+            },
+        );
+        std::fs::write(
+            Sidecar::path_for(&dir),
+            format!("{}\n{END_MARKER}\n", lean.to_ini()),
+        )
+        .unwrap();
+
+        assert_eq!(Sidecar::load(&dir).len(), 1, "the live file is authoritative");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_so_it_is_not_written_over() {
+        let dir = scratch("unreadable");
+        std::fs::write(Sidecar::path_for(&dir), "\u{0}\u{1}not ini at all").unwrap();
+
+        let report = Sidecar::load_detailed(&dir);
+        assert!(report.sidecar.is_empty());
+        assert!(
+            report.unreadable_file_present,
+            "a file with bytes in it that yields nothing must be flagged"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_notes_at_all_is_not_reported_as_unreadable() {
+        let dir = scratch("absent");
+        let report = Sidecar::load_detailed(&dir);
+        assert!(report.sidecar.is_empty());
+        assert!(!report.unreadable_file_present);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_file_falls_back_to_the_backup() {
+        let dir = scratch("truncated");
+
+        // Two good saves, so a backup exists.
+        sample().save(&dir).unwrap();
+        sample().save(&dir).unwrap();
+
+        // Simulate a write cut short: real content, but no end marker.
+        let path = Sidecar::path_for(&dir);
+        let full = std::fs::read_to_string(&path).unwrap();
+        let cut = &full[..full.len() / 2];
+        std::fs::write(&path, cut).unwrap();
+        assert!(!cut.contains(END_MARKER));
+
+        let recovered = Sidecar::load(&dir);
+        assert_eq!(recovered.len(), 2, "should have come from the backup");
+        assert_eq!(
+            recovered.get("IMG_0001.JPG").unwrap().description.as_deref(),
+            Some("Chinatown")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_neither_file_readable_it_starts_empty_rather_than_failing() {
+        let dir = scratch("garbage");
+        std::fs::write(Sidecar::path_for(&dir), "not even ini, and no marker").unwrap();
+        assert!(Sidecar::load(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn where_you_were_is_remembered() {
+        let dir = scratch("position");
+        let mut s = sample();
+        s.last_file = Some("IMG_0002.JPG".into());
+        s.last_index = Some(137);
+        s.save(&dir).unwrap();
+
+        let back = Sidecar::load(&dir);
+        assert_eq!(back.last_file.as_deref(), Some("IMG_0002.JPG"));
+        assert_eq!(back.last_index, Some(137));
+        // And it is not mistaken for a photo.
+        assert!(back.get(SESSION_SECTION).is_none());
+        assert_eq!(back.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_position_alone_is_still_worth_writing() {
+        let dir = scratch("position-only");
+        let mut s = Sidecar::default();
+        s.last_file = Some("IMG_0100.JPG".into());
+        s.last_index = Some(99);
+        s.save(&dir).unwrap();
+
+        assert!(Sidecar::path_for(&dir).exists());
+        assert_eq!(Sidecar::load(&dir).last_file.as_deref(), Some("IMG_0100.JPG"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crops_are_stored_as_whole_pixels() {
+        let mut s = Sidecar::default();
+        s.set(
+            "a.jpg",
+            PhotoState {
+                crop: Some(CropBox::new(100.4, 200.6, 2000.2, 3000.7)),
+                ..Default::default()
+            },
+        );
+        let text = s.to_ini().to_string();
+        assert!(text.contains("crop = 100,201,2000,3001"), "got: {text}");
+
+        let back = Sidecar::from_ini(&Ini::parse(&text));
+        let crop = back.get("a.jpg").unwrap().crop.unwrap();
+        assert!((crop.w - 2000.0).abs() < 1.0 && (crop.h - 3001.0).abs() < 1.0);
+    }
+
+    /// The size complaint that prompted all this: a folder of 11 000 photos
+    /// where a realistic number of decisions have been made must not produce a
+    /// file measured in hundreds of kilobytes.
+    #[test]
+    fn the_file_follows_the_work_done_not_the_size_of_the_folder() {
+        let mut s = Sidecar::default();
+        for i in 0..300 {
+            s.set(
+                &format!("IMG_2025{i:05}.JPG"),
+                PhotoState {
+                    selected: true,
+                    crop: Some(CropBox::new(120.0, 240.0, 2000.0, 3000.0)),
+                    ..Default::default()
+                },
+            );
+        }
+        s.last_file = Some("IMG_202500042.JPG".into());
+        s.last_index = Some(42);
+
+        let bytes = s.approximate_bytes();
+        assert!(
+            bytes < 32 * 1024,
+            "300 decided photos should be a few tens of KB, got {bytes} bytes"
+        );
+
+        // And photos merely walked past contribute nothing at all.
+        let before = s.approximate_bytes();
+        for i in 0..10_000 {
+            s.set(&format!("IMG_9{i:06}.JPG"), PhotoState::default());
+        }
+        assert_eq!(s.approximate_bytes(), before, "untouched photos must cost nothing");
     }
 }

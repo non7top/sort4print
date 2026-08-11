@@ -13,7 +13,10 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
 - **Crop.** The cut-out window starts as the largest centred window of your
   print proportion that fits the photo. Drag to move it, drag a handle to
   resize it — the proportions stay locked — and scroll to zoom. Edges and the
-  centre lines are magnetic, so a flush edge or an exact fit lands by hand.
+  centre lines are magnetic, so a flush edge or an exact fit lands by hand; the
+  centre pulls twice as far as an edge and wins when both are in reach, since
+  dead centre is the framing most often wanted and the most obvious when it is
+  a few pixels out.
   The window may reach past the photo, and whatever falls outside prints as the
   border colour; it will not grow past the point where the photo fits inside it
   entirely, since past there every extra pixel is border and none is picture.
@@ -32,6 +35,35 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
 Everything is decoded on background threads: the photos on either side of the
 one you are looking at are already loaded, rotated, measured and geocoded before
 you get to them.
+
+## Speed
+
+Three things stop a folder of eleven thousand photos being unusable.
+
+**Filmstrip rows use the thumbnail the camera already put in the file.** Reading
+a preview that is already there costs a fraction of a millisecond; decoding the
+twelve-megapixel original to produce the same postage stamp costs a hundred of
+them and a core to do it on. It is only accepted when its shape matches the
+photo's, since a few cameras pad theirs and a stretched thumbnail is worse than a
+slow one.
+
+**Decoded images are kept on disk.** Upright, already shrunk, as small JPEGs in
+the per-user cache directory — a fraction of the size of the original and a
+fraction of the time to decode. The key includes the photo's size and
+modification time, so an edited photo simply gets a new key and a stale entry can
+never be served. A budget is enforced by discarding least recently used entries.
+Everything in there is derived: deleting the directory costs time, never work.
+
+**Previews always beat thumbnails to the workers.** They are held in separate
+queues, and the thumbnail backlog is capped — scrolling a long list would
+otherwise queue thousands of jobs and leave the photo you are actually looking at
+waiting behind them. Rows still on screen ask again next frame, so dropping the
+oldest request costs nothing.
+
+**Read all** in the filmstrip goes through the whole folder once, filling the
+cache, so that browsing afterwards waits for nothing. It runs in the background,
+hands work out only as earlier jobs finish so it never gets in your way, shows
+progress, and can be stopped.
 
 ## Keyboard and mouse
 
@@ -91,9 +123,37 @@ folder, prefetch — go in `sort4print.ini` with the program. They belong to you
 not to any particular batch of photos.
 
 **Your decisions about these photos** — which are ticked, how each is cropped,
-place overrides, descriptions — go in `sort4print-notes.ini` in the folder of
-photos. They belong to the pictures, so copying that folder elsewhere takes them
-along, and sorting a second folder does not disturb the first.
+place overrides, descriptions, and which photo you were looking at — go in
+`sort4print-notes.ini` in the folder of photos. They belong to the pictures, so
+copying that folder elsewhere takes them along, and sorting a second folder does
+not disturb the first. Reopening a folder returns you to the photo you left off
+at; if that file has since gone, you land near where it was.
+
+Only choices actually made are recorded. Opening a photo gives it the default
+centred window, and that is not written down — it is recomputed identically next
+time — so the file's size follows the work done rather than the number of photos
+in the folder. A few hundred decisions is tens of kilobytes whether the folder
+holds two hundred pictures or eleven thousand.
+
+The notes are never overwritten in place: a new copy is written alongside,
+flushed to disk, and moved into position, keeping the previous one as
+`sort4print-notes.ini.bak`. Each file ends with an `# end` marker.
+
+Which copy is read follows one rule — *never discard what you cannot read*:
+
+- The live file finished being written → it wins, even if the backup holds more.
+  Deliberately unpicking everything has to be believed.
+- The live file was cut short but the backup is intact → the backup wins. This is
+  the case the backup exists for.
+- Neither carries a marker (both predate it, or both were cut short) → whichever
+  knows about more photos wins.
+- A file is there with bytes in it but nothing can be made of it → nothing is
+  written for that folder at all, and the status bar says so. An unreadable file
+  is never replaced by an empty one.
+
+A missing marker means "suspect", never "worthless": it is also exactly what a
+file from an older version looks like, and treating that as corruption is how a
+folder's worth of decisions was thrown away once.
 
 Both are written as soon as you let go of a control, not only on a clean exit,
 so killing the program loses at most the gesture in progress. The one thing not

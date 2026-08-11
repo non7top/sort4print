@@ -76,6 +76,33 @@ fn header(app: &mut Sort4Print, ui: &mut egui::Ui) {
             ui.colored_label(OK_GREEN, format!("✔ {exported} written"));
         }
     });
+
+    ui.horizontal(|ui| match &app.scan_all {
+        Some(scan) => {
+            let fraction = scan.fraction();
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(150.0)
+                    .text(format!("{}/{}", scan.next, scan.total)),
+            );
+            if ui.small_button("Stop").clicked() {
+                app.stop_scan_all();
+            }
+        }
+        None => {
+            if ui
+                .small_button("Read all")
+                .on_hover_text(
+                    "Go through the whole folder once, filling the cache, so that \
+                     browsing afterwards waits for nothing. Runs in the background \
+                     and can be stopped.",
+                )
+                .clicked()
+            {
+                app.start_scan_all();
+            }
+        }
+    });
     ui.add_space(4.0);
 }
 

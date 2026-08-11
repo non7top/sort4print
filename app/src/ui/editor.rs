@@ -134,6 +134,13 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let ratio = app.ratio_for(image_w, image_h);
 
     let area = ui.available_rect_before_wrap();
+
+    // Record how big this really is in screen pixels, which is what decides how
+    // sharp a preview needs to be. A laptop panel and an external monitor differ
+    // enough for it to be worth measuring rather than assuming.
+    let scale_factor = ui.ctx().pixels_per_point();
+    app.editor_long_px = (area.width().max(area.height()) * scale_factor).round() as u32;
+
     let response = ui.interact(
         area,
         ui.id().with("crop-canvas"),
@@ -179,7 +186,8 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
             if let Some(handle) = crop.hit_test(world.0, world.1, tolerance) {
                 app.drag = Some(DragState {
                     handle,
-                    last: world,
+                    start_pointer: world,
+                    start_box: crop,
                 });
             }
         }
@@ -196,14 +204,19 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         {
             let world = to_world(pos);
             crop = match drag.handle {
-                Handle::Move => {
-                    crop.apply_move(world.0 - drag.last.0, world.1 - drag.last.1, constraints)
-                }
-                handle => crop.apply_drag(handle, world, ratio, constraints),
+                // Always measured from where the drag began, so the snap that
+                // is applied afterwards never eats the movement that would have
+                // escaped it.
+                Handle::Move => drag.start_box.apply_move(
+                    world.0 - drag.start_pointer.0,
+                    world.1 - drag.start_pointer.1,
+                    constraints,
+                ),
+                // Resizing is already absolute: it works from the pointer and
+                // the anchored edge, neither of which is affected by the last
+                // frame's snapping.
+                handle => drag.start_box.apply_drag(handle, world, ratio, constraints),
             };
-            if let Some(drag) = app.drag.as_mut() {
-                drag.last = world;
-            }
             app.set_crop(index, crop);
         }
     }

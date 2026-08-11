@@ -662,7 +662,7 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     let mut preview_px = app.config.preview_max_px;
     if ui
-        .add(egui::Slider::new(&mut preview_px, 800..=4000).text("preview size, px"))
+        .add(egui::Slider::new(&mut preview_px, 800..=4000).text("preview size limit, px"))
         .on_hover_text("Only affects what is on screen; exports always use the original")
         .changed()
     {
@@ -670,9 +670,84 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
         app.clear_image_caches();
         changed = true;
     }
+    ui.label(
+        egui::RichText::new(format!(
+            "This screen shows the picture {} px across, so previews are being made \
+             at {} px — the nearest standard size that covers it, within the limit \
+             above. Another monitor gets its own size, and both stay cached.",
+            app.editor_long_px,
+            app.preview_target_px(),
+        ))
+        .small()
+        .weak(),
+    );
 
     ui.add_space(8.0);
-    ui.weak(format!("{} previews cached", app.prefetch.cached_count()));
+    ui.weak(format!("{} previews in memory", app.prefetch.cached_count()));
+
+    ui.add_space(12.0);
+    ui.label("Cache on disk");
+    ui.label(
+        egui::RichText::new(
+            "Decoded previews and thumbnails are kept on disk, so a folder opened \
+             a second time needs no decoding at all. An entry is a fraction of the \
+             size of the photo it came from, and everything here can be rebuilt \
+             from the originals — deleting it costs time, never work.",
+        )
+        .small()
+        .weak(),
+    );
+
+    changed |= ui
+        .checkbox(&mut app.config.cache.enabled, "Keep decoded images on disk")
+        .on_hover_text("Takes effect next time the program starts")
+        .changed();
+
+    let mut budget = app.config.cache.budget_mb;
+    if ui
+        .add(
+            egui::Slider::new(&mut budget, 128..=32_768)
+                .suffix(" MB")
+                .text("upper limit"),
+        )
+        .changed()
+    {
+        app.config.cache.budget_mb = budget;
+        changed = true;
+    }
+
+    if let Some(cache) = app.disk_cache.clone() {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!(
+                "{} entries, {} MB",
+                cache.entry_count(),
+                cache.total_bytes() / (1024 * 1024)
+            ));
+        });
+        ui.label(
+            egui::RichText::new(cache.root().display().to_string())
+                .small()
+                .monospace()
+                .weak(),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Read the whole folder").clicked() {
+                app.start_scan_all();
+            }
+            if ui
+                .button("Empty the cache")
+                .on_hover_text("Only discards decoded copies; your photos and notes are untouched")
+                .clicked()
+            {
+                match cache.clear() {
+                    Ok(()) => app.status = "Cache emptied.".into(),
+                    Err(e) => app.status = format!("Could not empty the cache: {e:#}"),
+                }
+            }
+        });
+    } else {
+        ui.weak("Off — previews are decoded fresh every time.");
+    }
 
     if changed {
         app.config_dirty = true;
@@ -731,7 +806,7 @@ fn about_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     {
         app.notes_changed_everywhere();
         app.save_config();
-        app.save_notes();
+        app.save_notes_now();
     }
 
     ui.add_space(10.0);

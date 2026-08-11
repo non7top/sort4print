@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use image::{imageops::FilterType, DynamicImage, RgbaImage};
 
+use crate::cache::{DiskCache, Kind};
 use crate::exif_data::{self, Orientation, PhotoMeta};
 
 /// File extensions the folder scanner accepts.
@@ -96,6 +97,190 @@ pub fn load_preview(path: &Path, max_px: u32) -> Result<Preview> {
         scale,
         meta,
     })
+}
+
+/// The photo's upright size, from its header alone.
+///
+/// A few milliseconds instead of a full decode, which is what lets a cached
+/// preview be used without any stored metadata beside it: the original is still
+/// the authority on its own dimensions.
+pub fn upright_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let meta = exif_data::read_meta(path);
+    let (w, h) = image::ImageReader::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("identifying {}", path.display()))?
+        .into_dimensions()
+        .with_context(|| format!("reading the size of {}", path.display()))?;
+    Ok(if meta.orientation.swaps_axes() {
+        (h, w)
+    } else {
+        (w, h)
+    })
+}
+
+/// Quality the cache stores at. High enough that the preview is not visibly
+/// worse than a fresh decode, low enough that entries stay small.
+const CACHE_QUALITY: u8 = 88;
+
+/// A preview, from the cache when it is there and from the original when it is
+/// not — in which case the result is written to the cache on the way out.
+///
+/// The cached image is stored already upright and already shrunk, so a hit is a
+/// small JPEG decode rather than a large one plus a rotate and a resample.
+pub fn load_preview_cached(
+    path: &Path,
+    max_px: u32,
+    cache: Option<&DiskCache>,
+) -> Result<Preview> {
+    let meta = exif_data::read_meta(path);
+    let key = cache.and_then(|_| DiskCache::key_for(path));
+
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        if let Some(bytes) = cache.read(key, Kind::View, max_px) {
+            if let Ok((full_w, full_h)) = upright_dimensions(path) {
+                if let Ok(rgba) = decode_bytes(&bytes) {
+                    let rgba = rgba.into_rgba8();
+                    let scale = if full_w > 0 {
+                        rgba.width() as f64 / full_w as f64
+                    } else {
+                        1.0
+                    };
+                    return Ok(Preview {
+                        rgba,
+                        full_w,
+                        full_h,
+                        scale,
+                        meta,
+                    });
+                }
+            }
+        }
+    }
+
+    let preview = load_preview(path, max_px)?;
+
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
+            let _ = cache.write(key, Kind::View, max_px, &bytes);
+        }
+    }
+    Ok(preview)
+}
+
+/// A filmstrip-sized image.
+///
+/// Tries the thumbnail the camera already put in the file first: it is two
+/// orders of magnitude cheaper than decoding the original, and it is the reason
+/// a list of eleven thousand photos can be scrolled at all. It is only accepted
+/// when its shape matches the photo's, since a few cameras pad theirs to a fixed
+/// size and a stretched thumbnail is worse than a slow one.
+pub fn load_thumb_cached(
+    path: &Path,
+    max_px: u32,
+    cache: Option<&DiskCache>,
+) -> Result<Preview> {
+    let meta = exif_data::read_meta(path);
+    let key = cache.and_then(|_| DiskCache::key_for(path));
+
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        if let Some(bytes) = cache.read(key, Kind::Thumb, max_px) {
+            if let Ok(image) = decode_bytes(&bytes) {
+                return Ok(as_preview(image.into_rgba8(), path, meta.clone()));
+            }
+        }
+    }
+
+    if let Some(embedded) = exif_data::read_exif_thumbnail(path) {
+        if let Ok(image) = decode_bytes(&embedded) {
+            let image = apply_orientation(image, meta.orientation);
+            if let Ok((full_w, full_h)) = upright_dimensions(path) {
+                if shapes_agree(image.width(), image.height(), full_w, full_h) {
+                    let shrunk = shrink_to(image, max_px).into_rgba8();
+                    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+                        if let Ok(bytes) = encode_jpeg(&shrunk, CACHE_QUALITY) {
+                            let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
+                        }
+                    }
+                    let scale = if full_w > 0 {
+                        shrunk.width() as f64 / full_w as f64
+                    } else {
+                        1.0
+                    };
+                    return Ok(Preview {
+                        rgba: shrunk,
+                        full_w,
+                        full_h,
+                        scale,
+                        meta,
+                    });
+                }
+            }
+        }
+    }
+
+    // Nothing usable to shortcut with: decode the original.
+    let preview = load_preview(path, max_px)?;
+    if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
+        if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
+            let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
+        }
+    }
+    Ok(preview)
+}
+
+/// Within a few per cent is the same shape; a padded thumbnail is not.
+fn shapes_agree(thumb_w: u32, thumb_h: u32, full_w: u32, full_h: u32) -> bool {
+    if thumb_h == 0 || full_h == 0 {
+        return false;
+    }
+    let a = thumb_w as f64 / thumb_h as f64;
+    let b = full_w as f64 / full_h as f64;
+    (a - b).abs() / b < 0.06
+}
+
+fn as_preview(rgba: image::RgbaImage, path: &Path, meta: PhotoMeta) -> Preview {
+    let (full_w, full_h) = upright_dimensions(path).unwrap_or((rgba.width(), rgba.height()));
+    let scale = if full_w > 0 {
+        rgba.width() as f64 / full_w as f64
+    } else {
+        1.0
+    };
+    Preview {
+        rgba,
+        full_w,
+        full_h,
+        scale,
+        meta,
+    }
+}
+
+fn shrink_to(image: DynamicImage, max_px: u32) -> DynamicImage {
+    let long = image.width().max(image.height());
+    if long <= max_px || max_px == 0 {
+        return image;
+    }
+    let scale = max_px as f64 / long as f64;
+    let w = ((image.width() as f64 * scale).round() as u32).max(1);
+    let h = ((image.height() as f64 * scale).round() as u32).max(1);
+    image.resize_exact(w, h, FilterType::Triangle)
+}
+
+fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("identifying a cached image")?
+        .decode()
+        .context("decoding a cached image")
+}
+
+fn encode_jpeg(rgba: &image::RgbaImage, quality: u8) -> Result<Vec<u8>> {
+    let rgb = DynamicImage::ImageRgba8(rgba.clone()).into_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(&rgb)
+        .context("encoding a cache entry")?;
+    Ok(out)
 }
 
 /// The original at full resolution, rotated upright. This is what the export
