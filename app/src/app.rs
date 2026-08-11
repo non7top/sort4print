@@ -563,7 +563,11 @@ impl Sort4Print {
             return;
         }
         let len = self.entries.len();
-        let restrict = self.config.nav == NavMode::Selected && self.selected_count() > 0;
+        let nav = self.config.nav;
+        // A walk that would visit nothing strands you with no way forward, so in
+        // that case it degrades to plain stepping rather than doing nothing.
+        let restrict = nav != NavMode::All
+            && self.entries.iter().any(|e| nav.accepts(e.selected));
 
         let mut index = self.current as isize;
         for _ in 0..len {
@@ -573,7 +577,7 @@ impl Sort4Print {
             } else if index >= len as isize {
                 index = 0;
             }
-            if !restrict || self.entries[index as usize].selected {
+            if !restrict || nav.accepts(self.entries[index as usize].selected) {
                 self.current = index as usize;
                 // A close-up of one photo says nothing about the next.
                 self.reset_view();

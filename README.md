@@ -7,9 +7,12 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
 
 ## What it does
 
-- **Pick.** Walk the folder with `←` / `→`, tick with `Space`. The count of
-  picked photos is always on screen, and a switch makes Next/Previous walk
-  either every photo or only the ones you ticked.
+- **Pick.** Walk the folder with `←` / `→`, tick with `Space`. A picked photo is
+  unmistakable: the space around it turns green, the crop window turns green, and
+  it is labelled in words as well as colour. The switch in the toolbar makes
+  Next/Previous walk **all** photos, only the **selected** ones, or only the
+  **unselected** ones — that last is the second pass, once the obvious keepers
+  are done and only the undecided ones are worth looking at.
 - **Crop.** The cut-out window starts as the largest centred window of your
   print proportion that fits the photo. Drag to move it, drag a handle to
   resize it — the proportions stay locked — and scroll to zoom. Edges and the

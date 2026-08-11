@@ -281,7 +281,15 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         to_screen(crop.right(), crop.bottom()),
     );
 
+    // Everything around the picture answers "is this one going to be printed?"
+    // without having to look anywhere else on screen.
+    let picked = app.current_is_selected();
+    painter.rect_filled(area, 0.0, surround_colour(ui, picked));
+
     // The window may extend past the photo; that area prints as background.
+    // This one is *not* tinted by the pick state — it is a preview of the actual
+    // printed border, and showing it as anything other than its real colour
+    // would be a lie about the output.
     let background = app.config.background;
     painter.rect_filled(
         crop_rect,
@@ -296,16 +304,12 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::Color32::WHITE,
     );
 
-    dim_outside(&painter, area, crop_rect);
+    dim_outside(&painter, area, crop_rect, picked);
     draw_caption_overlay(app, ui, index, crop_rect, &image);
 
     // Picked photos get a green window, so the decision is visible without
     // looking away from the picture.
-    let outline = if app.current_is_selected() {
-        OK_GREEN
-    } else {
-        ACCENT
-    };
+    let outline = if picked { OK_GREEN } else { ACCENT };
 
     painter.rect_stroke(
         crop_rect,
@@ -333,6 +337,28 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::FontId::proportional(12.0),
         ui.visuals().weak_text_color(),
     );
+
+    if picked {
+        picked_badge(&painter, area);
+    }
+}
+
+/// Says it in words as well as in colour, for the same reason a traffic light
+/// has positions: colour alone is not something everyone can read.
+fn picked_badge(painter: &egui::Painter, area: egui::Rect) {
+    let galley = painter.layout_no_wrap(
+        "✔ WILL BE PRINTED".to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    let padding = egui::vec2(10.0, 5.0);
+    let size = galley.size() + padding * 2.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.right() - size.x - 10.0, area.top() + 6.0),
+        size,
+    );
+    painter.rect_filled(rect, 4.0, OK_GREEN);
+    painter.galley(rect.min + padding, galley, egui::Color32::WHITE);
 }
 
 /// Magnifies the view about the pointer, so whatever is under it stays there.
@@ -381,8 +407,25 @@ fn view_zoom(
     }
 }
 
-fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect) {
-    let shade = egui::Color32::from_black_alpha(150);
+/// What fills the space around the photo. Green says "this one is going to be
+/// printed"; anything else is the ordinary dark surround.
+fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
+    if picked {
+        egui::Color32::from_rgb(20, 46, 28)
+    } else {
+        ui.visuals().extreme_bg_color
+    }
+}
+
+fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect, picked: bool) {
+    // Tinting the shade rather than only the empty space means the whole of the
+    // photo outside the crop carries the signal too, which is a much larger
+    // target for the eye than a border would be.
+    let shade = if picked {
+        egui::Color32::from_rgba_unmultiplied(18, 92, 44, 150)
+    } else {
+        egui::Color32::from_black_alpha(150)
+    };
     let top = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), crop.top()));
     let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), crop.bottom()), area.max);
     let left = egui::Rect::from_min_max(

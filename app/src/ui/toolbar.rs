@@ -107,24 +107,35 @@ fn print_size(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
 fn navigation(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.label("Walk");
-    let mut nav = app.config.nav;
-    let selected = app.selected_count();
 
-    if ui
-        .selectable_value(&mut nav, NavMode::All, "All")
-        .on_hover_text("Next/Previous steps through every photo in the folder")
-        .clicked()
-        || ui
-            .selectable_value(
-                &mut nav,
-                NavMode::Selected,
-                format!("Selected ({selected})"),
-            )
-            .on_hover_text("Next/Previous visits only the photos you ticked")
+    let total = app.entries.len();
+    let selected = app.selected_count();
+    let unselected = total.saturating_sub(selected);
+    let mut nav = app.config.nav;
+
+    for mode in NavMode::ALL {
+        let count = match mode {
+            NavMode::All => total,
+            NavMode::Selected => selected,
+            NavMode::Unselected => unselected,
+        };
+        let hint = match mode {
+            NavMode::All => "Next/Previous steps through every photo in the folder",
+            NavMode::Selected => "Next/Previous visits only the photos you ticked",
+            NavMode::Unselected => {
+                "Next/Previous visits only what you have not ticked — the second \
+                 pass, once the obvious ones are done"
+            }
+        };
+        if ui
+            .selectable_value(&mut nav, mode, format!("{} ({count})", mode.label()))
+            .on_hover_text(hint)
             .clicked()
-    {
-        app.config.nav = nav;
-        app.config_dirty = true;
+            && app.config.nav != nav
+        {
+            app.config.nav = nav;
+            app.config_dirty = true;
+        }
     }
 
     if selected > 0 {

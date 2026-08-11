@@ -184,19 +184,43 @@ fn trim_num(v: f64) -> String {
     s.to_string()
 }
 
-/// Whether the arrow keys / Next button walk the whole folder or only the
-/// pictures already ticked for printing.
+/// Which pictures the arrow keys and the Next button visit.
+///
+/// `Unselected` is for the second pass over a folder: having picked the obvious
+/// ones, it walks only what is left to decide, so the ones already dealt with
+/// stop getting in the way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavMode {
     All,
     Selected,
+    Unselected,
 }
 
 impl NavMode {
+    pub const ALL: [NavMode; 3] = [NavMode::All, NavMode::Selected, NavMode::Unselected];
+
     pub fn as_str(self) -> &'static str {
         match self {
             NavMode::All => "all",
             NavMode::Selected => "selected",
+            NavMode::Unselected => "unselected",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NavMode::All => "All",
+            NavMode::Selected => "Selected",
+            NavMode::Unselected => "Unselected",
+        }
+    }
+
+    /// Whether a picture belongs to this walk.
+    pub fn accepts(self, selected: bool) -> bool {
+        match self {
+            NavMode::All => true,
+            NavMode::Selected => selected,
+            NavMode::Unselected => !selected,
         }
     }
 
@@ -204,6 +228,7 @@ impl NavMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "all" => Some(NavMode::All),
             "selected" | "picked" => Some(NavMode::Selected),
+            "unselected" | "unpicked" | "remaining" => Some(NavMode::Unselected),
             _ => None,
         }
     }
@@ -618,7 +643,8 @@ fn comment_for(section: &str, key: &str) -> Option<String> {
     let text = match (section, key) {
         ("view", "navigate") => {
             "all = Next/Previous walk every picture in the folder\n\
-             selected = they walk only the ones ticked for printing"
+             selected = they walk only the ones ticked for printing\n\
+             unselected = they walk only the ones not ticked yet"
         }
         ("view", "preview_max_px") => {
             "Long side of the on-screen preview. Exports always re-read the\n\
@@ -878,6 +904,28 @@ mod tests {
         let r = AspectRatio::new(10.0, 15.0);
         assert!((r.value(true) - 1.5).abs() < 1e-9);
         assert!((r.value(false) - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_walk_mode_round_trips() {
+        for mode in NavMode::ALL {
+            assert_eq!(NavMode::parse(mode.as_str()), Some(mode), "{mode:?}");
+            let mut c = Config::default();
+            c.nav = mode;
+            let back = Config::from_ini(&Ini::parse(&c.to_ini_string()));
+            assert_eq!(back.nav, mode);
+        }
+        // The spellings people reach for.
+        assert_eq!(NavMode::parse("picked"), Some(NavMode::Selected));
+        assert_eq!(NavMode::parse("remaining"), Some(NavMode::Unselected));
+        assert_eq!(NavMode::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn a_walk_mode_accepts_the_right_pictures() {
+        assert!(NavMode::All.accepts(true) && NavMode::All.accepts(false));
+        assert!(NavMode::Selected.accepts(true) && !NavMode::Selected.accepts(false));
+        assert!(NavMode::Unselected.accepts(false) && !NavMode::Unselected.accepts(true));
     }
 
     #[test]
