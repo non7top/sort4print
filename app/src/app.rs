@@ -109,8 +109,17 @@ struct Keys {
 
 pub struct DragState {
     pub handle: Handle,
-    /// Pointer position at the last frame, in original-image pixels.
-    pub last: (f64, f64),
+    /// Where the pointer went down, in original-image pixels.
+    pub start_pointer: (f64, f64),
+    /// The window as it was when the drag began.
+    ///
+    /// A move is computed from these two every frame, rather than by adding
+    /// this frame's pointer delta to the window's current position. That
+    /// distinction is the whole difference between magnetism and glue: applying
+    /// deltas to an already-snapped box means each small movement is undone by
+    /// the snap that follows it, and the window can never leave an edge unless
+    /// the pointer jumps past the snap radius within a single frame.
+    pub start_box: CropBox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

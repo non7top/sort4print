@@ -798,6 +798,58 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_drag_can_leave_a_snapped_edge() {
+        let c = constraints();
+        let start = CropBox::new(0.0, 0.0, 2000.0, 3000.0); // flush against the left
+
+        // Twenty small steps, each on its own well inside the snap radius, but
+        // always measured from where the drag began. The window has to come
+        // away from the edge.
+        let mut out = start;
+        for step in 1..=20 {
+            out = start.apply_move(step as f64 * 5.0, 0.0, c);
+        }
+        assert!(out.x > c.snap, "never left the edge: x = {}", out.x);
+    }
+
+    /// Why the editor measures a move from where the drag began rather than
+    /// adding each frame's delta to the current position: feeding small steps
+    /// back into an already-snapped box means every one of them is undone by the
+    /// snap that follows, and the window is glued to the edge for good.
+    #[test]
+    fn feeding_small_steps_back_into_a_snapped_box_never_escapes() {
+        let c = constraints();
+        let mut stuck = CropBox::new(0.0, 0.0, 2000.0, 3000.0);
+        for _ in 0..20 {
+            stuck = stuck.apply_move(5.0, 0.0, c);
+        }
+        assert!(stuck.x.abs() < EPS, "this is the trap, x = {}", stuck.x);
+    }
+
+    #[test]
+    fn an_oversized_window_still_sticks_to_the_centre() {
+        let c = constraints();
+        // The cover window is taller than the photo, so its centred position is
+        // above the top edge — the case where sticking to the sides instead of
+        // the centre makes it impossible to place.
+        let (w, h) = c.cover_size(PORTRAIT);
+        let centred_y = (c.image_h - h) / 2.0;
+        assert!(centred_y < 0.0, "this test is about an oversized window");
+
+        let nudged = CropBox::new(0.0, centred_y + c.snap, w, h);
+        let out = nudged.apply_move(0.0, 0.0, c);
+        assert!(
+            (out.y - centred_y).abs() < EPS,
+            "y = {} should have settled on the centre {centred_y}",
+            out.y
+        );
+
+        // And it is still possible to get away from that centre deliberately.
+        let away = nudged.apply_move(0.0, c.snap * CENTRE_SNAP_FACTOR + 40.0, c);
+        assert!((away.y - centred_y).abs() > c.snap, "y = {} is still glued", away.y);
+    }
+
+    #[test]
     fn a_move_well_clear_of_an_edge_is_left_alone() {
         let c = constraints();
         let start = CropBox::new(1000.0, 0.0, 2000.0, 3000.0);
