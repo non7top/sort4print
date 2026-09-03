@@ -330,17 +330,34 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     if app.view_zoom > 1.001 {
         lines.push(format!("view {:.0}%", app.view_zoom * 100.0));
     }
-    painter.text(
-        egui::pos2(area.left() + 8.0, area.top() + 6.0),
-        egui::Align2::LEFT_TOP,
-        lines.join("   ·   "),
-        egui::FontId::proportional(12.0),
-        ui.visuals().weak_text_color(),
-    );
+    readout(&painter, area, &lines.join("   ·   "));
 
     if picked {
         picked_badge(&painter, area);
     }
+}
+
+/// The crop's dimensions and any warning about it, top left.
+///
+/// On its own backing plate rather than in the interface's usual weak grey:
+/// what is behind it is a dark surround, a green one, or the photograph itself,
+/// and grey text on any of those is unreadable.
+fn readout(painter: &egui::Painter, area: egui::Rect, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+    let padding = egui::vec2(8.0, 4.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.left() + 6.0, area.top() + 6.0),
+        galley.size() + padding * 2.0,
+    );
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(150));
+    painter.galley(rect.min + padding, galley, egui::Color32::WHITE);
 }
 
 /// Says it in words as well as in colour, for the same reason a traffic light
