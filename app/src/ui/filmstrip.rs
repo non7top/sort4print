@@ -171,7 +171,9 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
                 egui::Color32::WHITE,
             );
         }
-        None => painter.rect_filled(slot, 2.0, ui.visuals().extreme_bg_color),
+        None => {
+            painter.rect_filled(slot, 2.0, ui.visuals().extreme_bg_color);
+        }
     }
 
     // Name, and whatever else is worth saying about this one.
