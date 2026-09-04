@@ -304,7 +304,7 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::Color32::WHITE,
     );
 
-    dim_outside(&painter, area, crop_rect, picked);
+    dim_outside(&painter, area, crop_rect);
     draw_caption_overlay(app, ui, index, crop_rect, &image);
 
     // Picked photos get a green window, so the decision is visible without
@@ -428,21 +428,18 @@ fn view_zoom(
 /// printed"; anything else is the ordinary dark surround.
 fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
     if picked {
-        egui::Color32::from_rgb(20, 46, 28)
+        crate::ui::PICKED_GROUND
     } else {
         ui.visuals().extreme_bg_color
     }
 }
 
-fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect, picked: bool) {
-    // Tinting the shade rather than only the empty space means the whole of the
-    // photo outside the crop carries the signal too, which is a much larger
-    // target for the eye than a border would be.
-    let shade = if picked {
-        egui::Color32::from_rgba_unmultiplied(18, 92, 44, 150)
-    } else {
-        egui::Color32::from_black_alpha(150)
-    };
+fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect) {
+    // Neutral whatever the pick state. Tinting this green put a colour cast over
+    // the photograph, which is both far louder than the signal needed to be and
+    // a misrepresentation of the picture being judged. The ground around the
+    // photo, the outline and the badge carry it instead.
+    let shade = egui::Color32::from_black_alpha(150);
     let top = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), crop.top()));
     let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), crop.bottom()), area.max);
     let left = egui::Rect::from_min_max(

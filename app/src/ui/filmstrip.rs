@@ -151,7 +151,7 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
         painter.rect_filled(rect.shrink(1.0), 3.0, ui.visuals().selection.bg_fill);
     } else if selected {
         // A picked photo reads as picked in the list too, not only in the view.
-        painter.rect_filled(rect.shrink(1.0), 3.0, egui::Color32::from_rgb(20, 46, 28));
+        painter.rect_filled(rect.shrink(1.0), 3.0, crate::ui::PICKED_GROUND);
     }
 
     // Thumbnail, letterboxed into its slot so nothing is stretched.

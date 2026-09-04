@@ -15,6 +15,14 @@ use egui::Color32;
 pub const ACCENT: Color32 = Color32::from_rgb(255, 176, 32);
 pub const OK_GREEN: Color32 = Color32::from_rgb(102, 187, 106);
 
+/// Ground behind a picked photo, in the main view and in the list.
+///
+/// Deliberately a hint rather than a wash. The signal has to be readable at a
+/// glance without the eye being dragged to it, and nothing green may fall on the
+/// photograph itself — a tint over the picture misrepresents the thing you are
+/// judging.
+pub const PICKED_GROUND: Color32 = Color32::from_rgb(17, 30, 21);
+
 pub fn folder_label(path: &Option<std::path::PathBuf>, empty: &str) -> String {
     match path {
         Some(p) => {
