@@ -281,7 +281,15 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         to_screen(crop.right(), crop.bottom()),
     );
 
+    // Everything around the picture answers "is this one going to be printed?"
+    // without having to look anywhere else on screen.
+    let picked = app.current_is_selected();
+    painter.rect_filled(area, 0.0, surround_colour(ui, picked));
+
     // The window may extend past the photo; that area prints as background.
+    // This one is *not* tinted by the pick state — it is a preview of the actual
+    // printed border, and showing it as anything other than its real colour
+    // would be a lie about the output.
     let background = app.config.background;
     painter.rect_filled(
         crop_rect,
@@ -301,11 +309,7 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
     // Picked photos get a green window, so the decision is visible without
     // looking away from the picture.
-    let outline = if app.current_is_selected() {
-        OK_GREEN
-    } else {
-        ACCENT
-    };
+    let outline = if picked { OK_GREEN } else { ACCENT };
 
     painter.rect_stroke(
         crop_rect,
@@ -326,13 +330,52 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
     if app.view_zoom > 1.001 {
         lines.push(format!("view {:.0}%", app.view_zoom * 100.0));
     }
-    painter.text(
-        egui::pos2(area.left() + 8.0, area.top() + 6.0),
-        egui::Align2::LEFT_TOP,
-        lines.join("   ·   "),
+    readout(&painter, area, &lines.join("   ·   "));
+
+    if picked {
+        picked_badge(&painter, area);
+    }
+}
+
+/// The crop's dimensions and any warning about it, top left.
+///
+/// On its own backing plate rather than in the interface's usual weak grey:
+/// what is behind it is a dark surround, a green one, or the photograph itself,
+/// and grey text on any of those is unreadable.
+fn readout(painter: &egui::Painter, area: egui::Rect, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
         egui::FontId::proportional(12.0),
-        ui.visuals().weak_text_color(),
+        egui::Color32::WHITE,
     );
+    let padding = egui::vec2(8.0, 4.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.left() + 6.0, area.top() + 6.0),
+        galley.size() + padding * 2.0,
+    );
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(150));
+    painter.galley(rect.min + padding, galley, egui::Color32::WHITE);
+}
+
+/// Says it in words as well as in colour, for the same reason a traffic light
+/// has positions: colour alone is not something everyone can read.
+fn picked_badge(painter: &egui::Painter, area: egui::Rect) {
+    let galley = painter.layout_no_wrap(
+        "✔ WILL BE PRINTED".to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    let padding = egui::vec2(10.0, 5.0);
+    let size = galley.size() + padding * 2.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.right() - size.x - 10.0, area.top() + 6.0),
+        size,
+    );
+    painter.rect_filled(rect, 4.0, OK_GREEN);
+    painter.galley(rect.min + padding, galley, egui::Color32::WHITE);
 }
 
 /// Magnifies the view about the pointer, so whatever is under it stays there.
@@ -381,7 +424,21 @@ fn view_zoom(
     }
 }
 
+/// What fills the space around the photo. Green says "this one is going to be
+/// printed"; anything else is the ordinary dark surround.
+fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
+    if picked {
+        crate::ui::PICKED_GROUND
+    } else {
+        ui.visuals().extreme_bg_color
+    }
+}
+
 fn dim_outside(painter: &egui::Painter, area: egui::Rect, crop: egui::Rect) {
+    // Neutral whatever the pick state. Tinting this green put a colour cast over
+    // the photograph, which is both far louder than the signal needed to be and
+    // a misrepresentation of the picture being judged. The ground around the
+    // photo, the outline and the badge carry it instead.
     let shade = egui::Color32::from_black_alpha(150);
     let top = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), crop.top()));
     let bottom = egui::Rect::from_min_max(egui::pos2(area.left(), crop.bottom()), area.max);
