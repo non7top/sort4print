@@ -184,6 +184,44 @@ fn trim_num(v: f64) -> String {
     s.to_string()
 }
 
+/// Which palette the window chrome is drawn from.
+///
+/// Light is the default because that is what a Windows desktop application
+/// looks like, and this one is meant to look like it belongs. The area a
+/// photograph is judged against stays dark either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 2] = [Theme::Light, Theme::Dark];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Theme> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            _ => None,
+        }
+    }
+}
+
 /// Which pictures the arrow keys and the Next button visit.
 ///
 /// `Unselected` is for the second pass over a folder: having picked the obvious
@@ -355,6 +393,7 @@ pub struct Config {
     /// would throw the whole cache away every time it was resized.
     pub preview_max_px: u32,
     pub cache: CacheConfig,
+    pub theme: Theme,
 }
 
 impl Default for Config {
@@ -377,6 +416,7 @@ impl Default for Config {
             // per-step texture upload small enough not to be felt.
             preview_max_px: 1800,
             cache: CacheConfig::default(),
+            theme: Theme::default(),
         }
     }
 }
@@ -436,6 +476,10 @@ impl Config {
                 .get("view", "navigate")
                 .and_then(NavMode::parse)
                 .unwrap_or(d.nav),
+            theme: ini
+                .get("view", "theme")
+                .and_then(Theme::parse)
+                .unwrap_or(d.theme),
             ratio: ini
                 .get("crop", "ratio")
                 .and_then(AspectRatio::parse)
@@ -550,6 +594,7 @@ impl Config {
         ini.set("paths", "output_dir", &path_str(&self.output_dir));
 
         ini.set("view", "navigate", self.nav.as_str());
+        ini.set("view", "theme", self.theme.as_str());
         ini.set("view", "preview_max_px", &self.preview_max_px.to_string());
 
         ini.set("crop", "ratio", &self.ratio.to_config_string());
@@ -645,6 +690,11 @@ fn comment_for(section: &str, key: &str) -> Option<String> {
             "all = Next/Previous walk every picture in the folder\n\
              selected = they walk only the ones ticked for printing\n\
              unselected = they walk only the ones not ticked yet"
+        }
+        ("view", "theme") => {
+            "light or dark, for the window's chrome. The area a photograph is\n\
+             judged against stays dark either way, since a light surround\n\
+             changes how you read the exposure of the picture on it."
         }
         ("view", "preview_max_px") => {
             "Long side of the on-screen preview. Exports always re-read the\n\
@@ -904,6 +954,20 @@ mod tests {
         let r = AspectRatio::new(10.0, 15.0);
         assert!((r.value(true) - 1.5).abs() < 1e-9);
         assert!((r.value(false) - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_theme_round_trips() {
+        for theme in Theme::ALL {
+            assert_eq!(Theme::parse(theme.as_str()), Some(theme), "{theme:?}");
+            let mut c = Config::default();
+            c.theme = theme;
+            assert_eq!(Config::from_ini(&Ini::parse(&c.to_ini_string())).theme, theme);
+        }
+        assert_eq!(Theme::parse("LIGHT"), Some(Theme::Light));
+        assert_eq!(Theme::parse("puce"), None);
+        // Light by default: this is meant to look like a desktop application.
+        assert_eq!(Config::default().theme, Theme::Light);
     }
 
     #[test]

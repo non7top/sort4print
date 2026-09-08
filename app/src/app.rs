@@ -230,6 +230,9 @@ pub struct Sort4Print {
     /// A run through the whole folder filling the cache, so browsing afterwards
     /// waits for nothing. Holds the next index to queue.
     pub scan_all: Option<ScanAll>,
+    /// The palette currently installed, so a change to the setting is noticed
+    /// and applied without restarting.
+    applied_theme: sort4print_core::config::Theme,
     /// Per-photo choices for the open folder, mirrored to a notes file there.
     notes: Sidecar,
     notes_dirty: bool,
@@ -302,6 +305,9 @@ impl Sort4Print {
         );
         let config_ratio_text = config.ratio.to_config_string();
 
+        crate::ui::theme::apply_system_font(&cc.egui_ctx, &catalog);
+        crate::ui::theme::apply(&cc.egui_ctx, config.theme);
+
         let mut app = Sort4Print {
             entries: Vec::new(),
             current: 0,
@@ -332,6 +338,7 @@ impl Sort4Print {
             disk_cache,
             editor_long_px: 0,
             scan_all: None,
+            applied_theme: config.theme,
             config_path,
             config_dirty: false,
             config,
@@ -1183,6 +1190,11 @@ impl eframe::App for Sort4Print {
         });
 
         let ctx = ui.ctx().clone();
+
+        if self.applied_theme != self.config.theme {
+            crate::ui::theme::apply(&ctx, self.config.theme);
+            self.applied_theme = self.config.theme;
+        }
 
         self.prefetch.poll();
         self.poll_export();

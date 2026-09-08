@@ -95,12 +95,13 @@ directory belongs to you, and it leaves nothing behind except named cache
 volumes.
 
 ```sh
-./x test          # core test suite, native Linux
-./x check         # type-check the whole workspace against the Windows target
-./x build         # cross-compile a release build -> dist/sort4print.exe
+make test         # core test suite, native Linux
+make check        # type-check the whole workspace against the Windows target
+make build        # cross-compile a release build -> dist/sort4print.exe
+make help         # everything else: lint, fmt, pack-cities, shell, destroy
 ```
 
-`./x <anything else>` runs that command inside the container. Be warned that the
+`./x <anything else>` runs that command inside the same container. Be warned that the
 first `check` or `build` compiles the whole dependency tree for Windows, which
 is a long, CPU-hungry job; the test suite is far cheaper and covers everything
 except the widget code.
@@ -217,6 +218,25 @@ cut, loaded from the system font folder. The panel lists every installed font
 with a filter box and a style list, and previews the result live with the same
 renderer that writes the file. Picking a font that genuinely has a Black weight
 (Arial Black, Archivo Black, …) gets you one.
+
+## How it looks
+
+Windows 10's control style, which is worth naming precisely because it is not
+Windows 11's: square corners, a hairline border around anything clickable, a
+shallow gradient in the fill so controls read as raised objects, and one
+saturated accent for selection. Light chrome by default, since that is what a
+desktop application looks like; `[view] theme = dark` or the Speed tab switches
+it.
+
+The area a photograph is judged against stays dark either way. A light surround
+changes how you read the exposure of the picture sitting on it, and that is the
+one job this program has.
+
+Controls are coloured by what they do, so the routine ones and the destructive
+ones cannot be confused at a glance: blue opens something, green writes
+something out, amber takes a while, red discards. The interface font is the
+system's own — Segoe UI where it is installed — because matching the windows
+around it does more for looking native than any amount of border work.
 
 ## If it does not start
 

@@ -17,6 +17,7 @@ use sort4print_core::cropbox::{Constraints, CropBox, Handle};
 use sort4print_core::stamp::{self, StampStyle};
 
 use crate::app::{DragState, Sort4Print};
+use crate::ui::theme::{self, Tone};
 use crate::ui::{ACCENT, OK_GREEN};
 
 /// Grab radius for the handles, in screen pixels.
@@ -63,10 +64,16 @@ fn empty_state(ui: &mut egui::Ui) {
 
 fn controls(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        if ui.button("◀").on_hover_text("Previous (←)").clicked() {
+        if theme::button(ui, "◀", Tone::Neutral)
+            .on_hover_text("Previous (←)")
+            .clicked()
+        {
             app.step(-1);
         }
-        if ui.button("▶").on_hover_text("Next (→)").clicked() {
+        if theme::button(ui, "▶", Tone::Neutral)
+            .on_hover_text("Next (→)")
+            .clicked()
+        {
             app.step(1);
         }
 
@@ -82,8 +89,7 @@ fn controls(app: &mut Sort4Print, ui: &mut egui::Ui) {
         }
 
         ui.separator();
-        if ui
-            .button("Reset crop")
+        if theme::button(ui, "Reset crop", Tone::Neutral)
             .on_hover_text("Back to the largest centred window that fits")
             .clicked()
         {
@@ -91,10 +97,13 @@ fn controls(app: &mut Sort4Print, ui: &mut egui::Ui) {
         }
 
         if app.view_zoom > 1.001 {
-            if ui
-                .button(format!("Fit ({:.0}%)", app.view_zoom * 100.0))
-                .on_hover_text("Back to showing the whole photo")
-                .clicked()
+            if theme::button(
+                ui,
+                &format!("Fit ({:.0}%)", app.view_zoom * 100.0),
+                Tone::Caution,
+            )
+            .on_hover_text("Back to showing the whole photo")
+            .clicked()
             {
                 app.reset_view();
             }
@@ -427,10 +436,11 @@ fn view_zoom(
 /// What fills the space around the photo. Green says "this one is going to be
 /// printed"; anything else is the ordinary dark surround.
 fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
+    let _ = ui;
     if picked {
-        crate::ui::PICKED_GROUND
+        crate::ui::theme::CANVAS_PICKED
     } else {
-        ui.visuals().extreme_bg_color
+        crate::ui::theme::CANVAS
     }
 }
 
