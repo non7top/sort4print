@@ -505,7 +505,8 @@ fn draw_caption_overlay(
         return;
     }
     let text = app.caption_for(index, Some(image));
-    if text.trim().is_empty() {
+    let flag = app.flag_code_for(index, Some(image));
+    if text.trim().is_empty() && !(app.config.caption.flag.is_on() && flag.is_some()) {
         return;
     }
     let Some(font) = app.caption_font() else {
@@ -528,6 +529,7 @@ fn draw_caption_overlay(
     let key = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut hasher);
+        flag.hash(&mut hasher);
         w.hash(&mut hasher);
         h.hash(&mut hasher);
         caption_style_key(app, &mut hasher);
@@ -545,7 +547,7 @@ fn draw_caption_overlay(
         None => {
             let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
             let style = StampStyle::from_config(&app.config.caption, w, h);
-            stamp::draw_caption(&mut canvas, &text, &font, &style);
+            stamp::draw_caption(&mut canvas, &text, &font, &style, flag.as_deref());
             let color =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], canvas.as_raw());
             let texture =
@@ -575,11 +577,17 @@ fn caption_style_key(app: &Sort4Print, hasher: &mut impl Hasher) {
     c.fill.to_hex().hash(hasher);
     c.outline.to_hex().hash(hasher);
     c.uppercase.hash(hasher);
+    c.flag.as_str().hash(hasher);
 }
 
 /// Shown in the settings panel: the caption rendered by the real renderer on a
 /// ramp that runs light to dark, so both the fill and the outline can be judged.
-pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str) {
+pub fn caption_swatch(
+    app: &mut Sort4Print,
+    ui: &mut egui::Ui,
+    sample_text: &str,
+    flag_code: Option<&str>,
+) {
     let (w, h) = (420u32, 130u32);
     let Some(font) = app.caption_font() else {
         ui.weak("No font could be loaded.");
@@ -589,6 +597,7 @@ pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str
     let key = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         sample_text.hash(&mut hasher);
+        flag_code.hash(&mut hasher);
         caption_style_key(app, &mut hasher);
         hasher.finish()
     };
@@ -612,7 +621,7 @@ pub fn caption_swatch(app: &mut Sort4Print, ui: &mut egui::Ui, sample_text: &str
                 margin_px: style.margin_px / 4.0,
                 ..style
             };
-            stamp::draw_caption(&mut canvas, sample_text, &font, &style);
+            stamp::draw_caption(&mut canvas, sample_text, &font, &style, flag_code);
             let color =
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], canvas.as_raw());
             let texture =
