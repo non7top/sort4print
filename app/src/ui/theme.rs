@@ -193,7 +193,16 @@ fn shift(colour: Color32, amount: f32) -> Color32 {
 /// Installs the palette, the metrics and the fonts.
 pub fn apply(ctx: &egui::Context, theme: Theme) {
     let palette = Palette::of(theme);
-    let mut style = (*ctx.style()).clone();
+
+    // egui 0.36 keeps one style per theme and picks between them, rather than
+    // holding a single style. So the palette goes into that theme's slot and
+    // the theme is then selected, instead of overwriting one global style.
+    let slot = if palette.dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    };
+    let mut style = (*ctx.style_of(slot)).clone();
 
     // Square corners: two pixels, not the eight of a modern rounded look.
     let radius = CornerRadius::same(2);
@@ -301,7 +310,8 @@ pub fn apply(ctx: &egui::Context, theme: Theme) {
         .text_styles
         .insert(TextStyle::Small, FontId::new(11.5, FontFamily::Proportional));
 
-    ctx.set_style(style);
+    ctx.set_style_of(slot, style);
+    ctx.set_theme(slot);
 }
 
 /// Uses the system's own interface font when it can be found.
