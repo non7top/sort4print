@@ -877,6 +877,16 @@ impl Sort4Print {
         self.caption_font.clone()
     }
 
+    /// The country code for the flag, from the geocoded place or from a
+    /// hand-typed country name.
+    pub fn flag_code_for(&self, index: usize, image: Option<&LoadedImage>) -> Option<String> {
+        let entry = self.entries.get(index)?;
+        export::flag_code(
+            image.and_then(|i| i.place.as_ref()),
+            entry.country_override.as_deref(),
+        )
+    }
+
     pub fn caption_for(&self, index: usize, image: Option<&LoadedImage>) -> String {
         let Some(entry) = self.entries.get(index) else {
             return String::new();
@@ -987,6 +997,10 @@ impl Sort4Print {
                             description.as_deref(),
                             &stem,
                         );
+                        let flag = export::flag_code(
+                            place.as_ref(),
+                            country_override.as_deref(),
+                        );
                         export::export(
                             &path,
                             &output_dir,
@@ -994,6 +1008,7 @@ impl Sort4Print {
                             &config,
                             &caption,
                             font.as_deref(),
+                            flag.as_deref(),
                         )?;
                         Ok(())
                     })();

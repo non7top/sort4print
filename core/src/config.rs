@@ -69,6 +69,54 @@ impl Corner {
     }
 }
 
+/// Whether a flag is drawn beside the caption, and on which side.
+///
+/// It spans the whole caption rather than sitting on one line: a two-line
+/// caption gets a flag two lines tall. A flag is a picture, not a letter, and
+/// scaling it to one line of text next to two lines of words looks like a
+/// mistake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlagPlacement {
+    #[default]
+    Off,
+    Left,
+    Right,
+}
+
+impl FlagPlacement {
+    pub const ALL: [FlagPlacement; 3] =
+        [FlagPlacement::Off, FlagPlacement::Left, FlagPlacement::Right];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlagPlacement::Off => "off",
+            FlagPlacement::Left => "left",
+            FlagPlacement::Right => "right",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FlagPlacement::Off => "No flag",
+            FlagPlacement::Left => "Flag left",
+            FlagPlacement::Right => "Flag right",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<FlagPlacement> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "no" | "none" | "false" => Some(FlagPlacement::Off),
+            "left" => Some(FlagPlacement::Left),
+            "right" => Some(FlagPlacement::Right),
+            _ => None,
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self != FlagPlacement::Off
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -253,6 +301,7 @@ pub struct CaptionConfig {
     /// Distance from the image edges, percentage of the short side.
     pub margin_pct: f32,
     pub uppercase: bool,
+    pub flag: FlagPlacement,
 }
 
 impl Default for CaptionConfig {
@@ -272,6 +321,7 @@ impl Default for CaptionConfig {
             outline_pct: 14.0,
             margin_pct: 2.5,
             uppercase: false,
+            flag: FlagPlacement::default(),
         }
     }
 }
@@ -482,6 +532,10 @@ impl Config {
                     .map(|v| v.clamp(0.0, 40.0))
                     .unwrap_or(dc.margin_pct),
                 uppercase: ini.get_bool("caption", "uppercase", dc.uppercase),
+                flag: ini
+                    .get("caption", "flag")
+                    .and_then(FlagPlacement::parse)
+                    .unwrap_or(dc.flag),
             },
             date_locale: ini.get_or("date", "locale", &d.date_locale).to_string(),
             date_pattern: ini.get_or("date", "format", &d.date_pattern).to_string(),
@@ -575,6 +629,7 @@ impl Config {
         ini.set("caption", "outline_pct", &trim_num(c.outline_pct as f64));
         ini.set("caption", "margin_pct", &trim_num(c.margin_pct as f64));
         ini.set("caption", "uppercase", bool_str(c.uppercase));
+        ini.set("caption", "flag", c.flag.as_str());
 
         ini.set("date", "locale", &self.date_locale);
         ini.set("date", "format", &self.date_pattern);
@@ -669,6 +724,11 @@ fn comment_for(section: &str, key: &str) -> Option<String> {
              {place} is city and country joined, and collapses cleanly when\n\
              one of them is unknown. {description} is the per-photo note you\n\
              type in the panel, e.g. Chinatown."
+        }
+        ("caption", "flag") => {
+            "off, left or right: draws the country's flag beside the caption,\n\
+             spanning its whole height. Take {country} out of the text when\n\
+             using this, or the country is named twice."
         }
         ("caption", "size_pct") => "Font size as a percentage of the cropped image's short side.",
         ("caption", "outline_pct") => "Outline thickness as a percentage of the font size.",

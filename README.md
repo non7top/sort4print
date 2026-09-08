@@ -28,6 +28,9 @@ One Windows `.exe`. No installer, no runtime to install, no network access.
   corner. City and country come from the GPS fix matched against a database
   built into the exe, so it works with no network; both can be overridden per
   photo or for the whole folder.
+- **Flag instead of the country's name.** The country's flag can be drawn beside
+  the caption, on either side, at the height of the whole thing — two lines of
+  words give a flag two lines tall.
 - **Notes stay put.** Ticks, crop windows, place overrides and descriptions are
   written to `sort4print-notes.ini` in the folder of photos, so closing the
   program half way through a holiday does not throw the work away. Deleting
@@ -114,7 +117,17 @@ it from a newer GeoNames dump:
 curl -o data/cities15000.zip https://download.geonames.org/export/dump/cities15000.zip
 curl -o data/countryInfo.txt https://download.geonames.org/export/dump/countryInfo.txt
 unzip -o data/cities15000.zip -d data
-./x pack-cities
+make pack-cities
+```
+
+### Refreshing the flags
+
+`assets/flags.bin` is committed too. To rebuild it:
+
+```sh
+curl -Lo data/country-flags.zip https://github.com/hampusborgos/country-flags/archive/refs/heads/main.zip
+unzip -o data/country-flags.zip -d data
+make pack-flags
 ```
 
 ## What is remembered
@@ -260,7 +273,29 @@ tools/   the build-time packer for the city database.
 The split exists so the parts worth testing can be tested in the same container
 that cross-compiles the exe, without a display.
 
+## About the flags
+
+There is no font route to this, which is worth saying because it is the obvious
+first idea. The Unicode way to write a flag is a pair of regional-indicator
+letters, and Windows deliberately renders those as two boxed letters — Segoe UI
+Emoji ships no flag glyphs at all. A colour emoji font could be carried instead,
+but the caption renderer rasterises glyph *outlines*, and a colour font stores
+its flags as embedded bitmaps or layered paint tables, neither of which an
+outline rasteriser can see.
+
+So they are drawings. 251 public-domain SVGs, gzipped into a 1.2 MB blob baked
+into the exe — nothing to install and nothing to download. They stay as drawings
+rather than pictures of a chosen size because a print can be any size at any
+density: each flag is rendered at exactly the height the caption needs, so it is
+never soft on a big print. Compressed, the whole set costs less than one
+fixed-size raster of it would.
+
 ## Attribution
 
 City and country data derived from [GeoNames](https://www.geonames.org/),
 licensed CC BY 4.0.
+
+Flags from [hampusborgos/country-flags](https://github.com/hampusborgos/country-flags),
+a public-domain collection derived from Wikimedia Commons. Flags themselves are
+state symbols and not under copyright, though individual countries may place
+other restrictions on their use.

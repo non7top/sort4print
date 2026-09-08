@@ -1,7 +1,7 @@
 //! The right-hand panel: what applies to the picture in front of you at the
 //! top, and the settings that apply to everything below it.
 
-use sort4print_core::config::{Color, Corner};
+use sort4print_core::config::{Color, Corner, FlagPlacement};
 use sort4print_core::datefmt::{PhotoDate, PRESETS, TOKEN_HINT};
 use sort4print_core::geo::CityDb;
 
@@ -293,6 +293,53 @@ fn caption_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
             .changed();
     });
 
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Flag");
+        for option in FlagPlacement::ALL {
+            if theme::segment(ui, option.label(), app.config.caption.flag == option).clicked()
+                && app.config.caption.flag != option
+            {
+                app.config.caption.flag = option;
+                changed = true;
+            }
+        }
+    });
+    if app.config.caption.flag.is_on() {
+        ui.label(
+            egui::RichText::new(
+                "The country's flag, drawn to the height of the whole caption — two \
+                 lines of words give a flag two lines tall. Drawn from the country \
+                 of the photo, or from the one typed above.",
+            )
+            .small()
+            .weak(),
+        );
+        if app.config.caption.template.contains("{country}")
+            || app.config.caption.template.contains("{place}")
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    theme::WARN_AMBER,
+                    "The text names the country as well as the flag.",
+                );
+                if theme::button(ui, "Use just the flag", Tone::Caution)
+                    .on_hover_text("Takes the country out of the caption text")
+                    .clicked()
+                {
+                    // {place} is city and country together, so it becomes {city}.
+                    app.config.caption.template = app
+                        .config
+                        .caption
+                        .template
+                        .replace("{place}", "{city}")
+                        .replace("{country}", "");
+                    changed = true;
+                }
+            });
+        }
+    }
+
     ui.add_space(8.0);
     changed |= font_picker(app, ui);
 
@@ -331,7 +378,14 @@ fn caption_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.add_space(10.0);
     ui.label("Preview");
     let sample = sample_caption(app);
-    caption_swatch(app, ui, &sample);
+    let sample_flag = if app.config.caption.flag.is_on() {
+        // Whatever the current photo would use, or a stand-in so the preview is
+        // not empty before a folder is open.
+        app.flag_code_for(app.current, None).or(Some("pt".to_string()))
+    } else {
+        None
+    };
+    caption_swatch(app, ui, &sample, sample_flag.as_deref());
 
     if changed {
         app.config_dirty = true;

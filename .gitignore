@@ -4,3 +4,5 @@
 # artifact that actually ships. See README for the refresh command.
 /data/*.txt
 /data/*.zip
+/data/country-flags-main/
+/data/flags-svgz/

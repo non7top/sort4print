@@ -161,6 +161,27 @@ impl CityDb {
             .collect()
     }
 
+    /// Every country code the database can name, for checking flag coverage.
+    pub fn country_codes(&self) -> impl Iterator<Item = &str> {
+        self.countries.iter().map(|(code, _)| code.as_str())
+    }
+
+    /// The code for a country named in full.
+    ///
+    /// Needed because a caption's country can be typed by hand, and a flag is
+    /// chosen by code — without this, overriding the country to "France" would
+    /// silently drop the flag.
+    pub fn country_code_for_name(&self, name: &str) -> Option<&str> {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return None;
+        }
+        self.countries
+            .iter()
+            .find(|(_, country)| country.eq_ignore_ascii_case(wanted))
+            .map(|(code, _)| code.as_str())
+    }
+
     fn place(&self, i: usize, from_lat: f64, from_lon: f64) -> Place {
         let c = &self.cities[i];
         let (code, country) = &self.countries[c.country_idx as usize];
@@ -298,6 +319,24 @@ mod tests {
     fn rejects_a_corrupt_blob() {
         assert!(CityDb::parse(b"nope").is_err());
         assert!(CityDb::parse(b"S4PC\x02").is_err());
+    }
+
+    #[test]
+    fn a_country_can_be_looked_up_by_its_name() {
+        let db = CityDb::embedded();
+        assert_eq!(db.country_code_for_name("France"), Some("FR"));
+        assert_eq!(db.country_code_for_name("  france  "), Some("FR"));
+        assert_eq!(db.country_code_for_name("Russia"), Some("RU"));
+        assert_eq!(db.country_code_for_name("Neverland"), None);
+        assert_eq!(db.country_code_for_name(""), None);
+    }
+
+    #[test]
+    fn every_country_has_a_code() {
+        let db = CityDb::embedded();
+        let codes: Vec<&str> = db.country_codes().collect();
+        assert!(codes.len() > 200, "only {} countries", codes.len());
+        assert!(codes.iter().all(|c| c.len() == 2));
     }
 
     #[test]

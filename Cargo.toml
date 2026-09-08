@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "app", "tools/pack-cities"]
+members = ["core", "app", "tools/pack-cities", "tools/pack-flags"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,9 @@ image = { version = "0.25", default-features = false, features = [
 kamadak-exif = "0.6"
 ab_glyph = "0.2"
 ttf-parser = "0.25"
+# Flags are SVG, rendered at whatever size the print needs. Text support is off
+# on purpose: flags carry none, and it is what drags in a whole font stack.
+resvg = { version = "0.48", default-features = false, features = ["svgz"] }
 
 [profile.release]
 opt-level = 3
