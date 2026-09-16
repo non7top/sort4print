@@ -297,7 +297,8 @@ fn caption_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Flag");
         for option in FlagPlacement::ALL {
-            if theme::segment(ui, option.label(), app.config.caption.flag == option).clicked()
+            let selected = app.config.caption.flag == option;
+            if ui.selectable_label(selected, option.label()).clicked()
                 && app.config.caption.flag != option
             {
                 app.config.caption.flag = option;
@@ -320,10 +321,11 @@ fn caption_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
         {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
-                    theme::WARN_AMBER,
+                    egui::Color32::from_rgb(230, 180, 90),
                     "The text names the country as well as the flag.",
                 );
-                if theme::button(ui, "Use just the flag", Tone::Caution)
+                if ui
+                    .button("Use just the flag")
                     .on_hover_text("Takes the country out of the caption text")
                     .clicked()
                 {
