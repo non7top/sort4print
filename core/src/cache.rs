@@ -156,6 +156,43 @@ impl DiskCache {
         self.entry_path(key, kind, size_px).is_file()
     }
 
+    /// Where the sidecar for a photo's size and EXIF fields lives. One per
+    /// photo rather than per `Kind`/`size_px`: the original's dimensions and
+    /// metadata do not change with the size a preview was cached at.
+    fn meta_path(&self, key: &str) -> PathBuf {
+        let shard = &key[..2.min(key.len())];
+        self.root.join(shard).join(format!("{key}.m"))
+    }
+
+    /// The bytes a `View`/`Thumb` hit needs instead of reopening the original
+    /// — its upright size and the EXIF fields the caption and geocoding read.
+    /// Absent for an entry cached before this sidecar existed; the caller
+    /// falls back to the original once and writes it via [`write_meta`].
+    ///
+    /// [`write_meta`]: DiskCache::write_meta
+    pub fn read_meta(&self, key: &str) -> Option<Vec<u8>> {
+        let path = self.meta_path(key);
+        let bytes = std::fs::read(&path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let _ = filetime_now(&path);
+        Some(bytes)
+    }
+
+    pub fn write_meta(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.meta_path(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let temporary = path.with_extension("part");
+        std::fs::write(&temporary, bytes)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("moving into {}", path.display()))
+    }
+
     /// Sizes a preview is cached at.
     ///
     /// Bucketed rather than following the window exactly, so that dragging a
@@ -163,6 +200,15 @@ impl DiskCache {
     /// entries instead of making a new one for every width the window has ever
     /// had.
     pub const SIZE_BUCKETS: &'static [u32] = &[1000, 1400, 1800, 2200, 2800, 3600];
+
+    /// The size ordinary browsing and "Read all" target, decoupled from
+    /// whatever the editor pane's width happens to be — that follows the
+    /// window instead (see [`bucket_for`]). Deliberately the smallest
+    /// bucket, so a quick-view entry and the editor's own preview on a
+    /// narrow window are the same cache entry rather than two.
+    ///
+    /// [`bucket_for`]: DiskCache::bucket_for
+    pub const QUICK_VIEW_PX: u32 = Self::SIZE_BUCKETS[0];
 
     /// The bucket that covers `wanted`, never exceeding `cap`.
     pub fn bucket_for(wanted: u32, cap: u32) -> u32 {
@@ -427,6 +473,29 @@ mod tests {
         assert_eq!(cache.entry_count(), 0);
         // Clearing again, with nothing there, is not an error.
         cache.clear().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meta_sidecar_round_trips_and_is_absent_until_written() {
+        let dir = scratch("meta");
+        let cache = DiskCache::new(dir.join("cache"), 10_000_000);
+
+        // An entry cached before the sidecar existed: no meta file yet.
+        cache.write("abcdef0123456789", Kind::View, 1800, b"view bytes").unwrap();
+        assert!(cache.read_meta("abcdef0123456789").is_none());
+
+        cache.write_meta("abcdef0123456789", b"some meta bytes").unwrap();
+        assert_eq!(
+            cache.read_meta("abcdef0123456789").as_deref(),
+            Some(&b"some meta bytes"[..])
+        );
+        // The image entry the sidecar sits beside is untouched.
+        assert_eq!(
+            cache.read("abcdef0123456789", Kind::View, 1800).as_deref(),
+            Some(&b"view bytes"[..])
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

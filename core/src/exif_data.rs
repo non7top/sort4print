@@ -43,6 +43,21 @@ impl Orientation {
         }
     }
 
+    /// The EXIF tag value this variant was decoded from, for round-tripping
+    /// through the disk-cache metadata sidecar.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Orientation::Normal => 1,
+            Orientation::FlipHorizontal => 2,
+            Orientation::Rotate180 => 3,
+            Orientation::FlipVertical => 4,
+            Orientation::Transpose => 5,
+            Orientation::Rotate90 => 6,
+            Orientation::Transverse => 7,
+            Orientation::Rotate270 => 8,
+        }
+    }
+
     /// True when applying it exchanges width and height.
     pub fn swaps_axes(self) -> bool {
         matches!(
@@ -397,6 +412,14 @@ mod tests {
         assert!(Orientation::from_exif(1).is_identity());
         // Unknown values degrade to normal rather than erroring.
         assert!(Orientation::from_exif(99).is_identity());
+    }
+
+    #[test]
+    fn orientation_round_trips_through_its_byte_form() {
+        for value in 1..=8u32 {
+            let orientation = Orientation::from_exif(value);
+            assert_eq!(Orientation::from_exif(orientation.as_u8() as u32), orientation);
+        }
     }
 
     #[test]
