@@ -10,7 +10,7 @@
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont};
 use image::{Rgba, RgbaImage};
 
-use crate::config::{Color, Corner};
+use crate::config::{Color, Corner, FlagPlacement};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StampStyle {
@@ -20,6 +20,7 @@ pub struct StampStyle {
     pub outline_px: f32,
     pub margin_px: f32,
     pub corner: Corner,
+    pub flag: FlagPlacement,
 }
 
 impl StampStyle {
@@ -36,73 +37,190 @@ impl StampStyle {
             outline_px: size_px * caption.outline_pct / 100.0,
             margin_px: short * caption.margin_pct / 100.0,
             corner: caption.corner,
+            flag: caption.flag,
         }
     }
 }
 
-/// Draws `text` into the corner of `target`.
+/// Draws `text` into the corner of `target`, optionally with a country's flag
+/// beside it.
 ///
-/// Returns false when there was nothing to draw (empty text, or a font with no
-/// usable glyphs for it), which the caller can treat as "no caption" rather
-/// than as an error.
-pub fn draw_caption(target: &mut RgbaImage, text: &str, font: &FontVec, style: &StampStyle) -> bool {
+/// Returns false when there was nothing to draw (empty text and no flag, or a
+/// font with no usable glyphs), which the caller can treat as "no caption"
+/// rather than as an error.
+pub fn draw_caption(
+    target: &mut RgbaImage,
+    text: &str,
+    font: &FontVec,
+    style: &StampStyle,
+    flag_code: Option<&str>,
+) -> bool {
     let text = text.trim();
-    if text.is_empty() || style.size_px <= 0.0 {
+    if style.size_px <= 0.0 {
         return false;
     }
-    let Some(mask) = rasterize(text, font, style) else {
-        return false;
-    };
 
     let radius = style.outline_px.max(0.0);
     let (img_w, img_h) = (target.width() as f32, target.height() as f32);
 
-    // The block that has to sit inside the margin is the ink plus the outline
-    // that surrounds it, otherwise a thick outline would hang off the edge.
-    let visual_min_x = mask.ink_min_x - radius;
-    let visual_min_y = mask.ink_min_y - radius;
-    let visual_w = (mask.ink_max_x - mask.ink_min_x) + 2.0 * radius;
-    let visual_h = (mask.ink_max_y - mask.ink_min_y) + 2.0 * radius;
-
-    let dest_x = if style.corner.is_right() {
-        img_w - style.margin_px - visual_w
+    let mask = if text.is_empty() {
+        None
     } else {
-        style.margin_px
-    };
-    let dest_y = if style.corner.is_bottom() {
-        img_h - style.margin_px - visual_h
-    } else {
-        style.margin_px
+        rasterize(text, font, style)
     };
 
-    let off_x = (dest_x - visual_min_x).round() as i64;
-    let off_y = (dest_y - visual_min_y).round() as i64;
+    // The flag is rendered to the height of the words beside it, so a two-line
+    // caption gets a two-line flag. With no words it stands alone at one line.
+    let (text_w, text_h) = match &mask {
+        Some(mask) => (
+            mask.ink_max_x - mask.ink_min_x,
+            mask.ink_max_y - mask.ink_min_y,
+        ),
+        None => (0.0, style.size_px),
+    };
 
-    let outline_alpha = distance_outline(&mask, radius);
-
-    for my in 0..mask.h {
-        let ty = my as i64 + off_y;
-        if ty < 0 || ty >= target.height() as i64 {
-            continue;
+    let flag = match (style.flag, flag_code) {
+        (FlagPlacement::Off, _) | (_, None) => None,
+        (_, Some(code)) => {
+            let height = text_h.round().clamp(4.0, 4096.0) as u32;
+            crate::flags::FlagSet::embedded().image(code, height)
         }
-        for mx in 0..mask.w {
-            let tx = mx as i64 + off_x;
-            if tx < 0 || tx >= target.width() as i64 {
+    };
+
+    if mask.is_none() && flag.is_none() {
+        return false;
+    }
+
+    let (flag_w, flag_h) = flag
+        .as_ref()
+        .map(|f| (f.width() as f32, f.height() as f32))
+        .unwrap_or((0.0, 0.0));
+    // A gap proportional to the flag, so it holds at any print size.
+    let gap = if flag.is_some() && mask.is_some() {
+        text_h * 0.30
+    } else {
+        0.0
+    };
+
+    // What has to fit inside the margin: the words plus their outline, the
+    // flag plus its own edge, and the gap between them.
+    let text_block_w = if mask.is_some() { text_w + 2.0 * radius } else { 0.0 };
+    let text_block_h = if mask.is_some() { text_h + 2.0 * radius } else { 0.0 };
+    let flag_block_w = if flag.is_some() { flag_w + 2.0 * radius } else { 0.0 };
+    let flag_block_h = if flag.is_some() { flag_h + 2.0 * radius } else { 0.0 };
+
+    let block_w = text_block_w + gap + flag_block_w;
+    let block_h = text_block_h.max(flag_block_h);
+
+    let block_x = if style.corner.is_right() {
+        img_w - style.margin_px - block_w
+    } else {
+        style.margin_px
+    };
+    let block_y = if style.corner.is_bottom() {
+        img_h - style.margin_px - block_h
+    } else {
+        style.margin_px
+    };
+
+    let flag_first = style.flag == FlagPlacement::Left;
+    let (flag_block_x, text_block_x) = if flag.is_none() {
+        (0.0, block_x)
+    } else if flag_first {
+        (block_x, block_x + flag_block_w + gap)
+    } else {
+        (block_x + text_block_w + gap, block_x)
+    };
+
+    // Both are centred on the block, which matters when the flag's proportions
+    // make it slightly taller or shorter than the words.
+    let text_block_y = block_y + (block_h - text_block_h) / 2.0;
+    let flag_block_y = block_y + (block_h - flag_block_h) / 2.0;
+
+    if let Some(flag) = &flag {
+        let x = (flag_block_x + radius).round() as i64;
+        let y = (flag_block_y + radius).round() as i64;
+        // The same outline the words get, as a border. Without it a flag with a
+        // white or pale edge — Japan's, Poland's — disappears into a bright
+        // photograph.
+        if radius > 0.0 {
+            fill_rect(
+                target,
+                x - radius.round() as i64,
+                y - radius.round() as i64,
+                flag.width() + 2 * radius.round() as u32,
+                flag.height() + 2 * radius.round() as u32,
+                style.outline,
+            );
+        }
+        overlay(target, flag, x, y);
+    }
+
+    if let Some(mask) = &mask {
+        let off_x = (text_block_x - (mask.ink_min_x - radius)).round() as i64;
+        let off_y = (text_block_y - (mask.ink_min_y - radius)).round() as i64;
+        let outline_alpha = distance_outline(mask, radius);
+
+        for my in 0..mask.h {
+            let ty = my as i64 + off_y;
+            if ty < 0 || ty >= target.height() as i64 {
                 continue;
             }
-            let i = my * mask.w + mx;
-            let (ox, oy) = (tx as u32, ty as u32);
-            let o = outline_alpha[i];
-            if o > 0.0 {
-                blend(target, ox, oy, style.outline, o);
-            }
-            let c = mask.coverage[i];
-            if c > 0.0 {
-                blend(target, ox, oy, style.fill, c);
+            for mx in 0..mask.w {
+                let tx = mx as i64 + off_x;
+                if tx < 0 || tx >= target.width() as i64 {
+                    continue;
+                }
+                let i = my * mask.w + mx;
+                let (ox, oy) = (tx as u32, ty as u32);
+                let o = outline_alpha[i];
+                if o > 0.0 {
+                    blend(target, ox, oy, style.outline, o);
+                }
+                let c = mask.coverage[i];
+                if c > 0.0 {
+                    blend(target, ox, oy, style.fill, c);
+                }
             }
         }
     }
+
     true
+}
+
+/// A solid rectangle, clipped to the target.
+fn fill_rect(target: &mut RgbaImage, x: i64, y: i64, w: u32, h: u32, colour: Color) {
+    for dy in 0..h as i64 {
+        let ty = y + dy;
+        if ty < 0 || ty >= target.height() as i64 {
+            continue;
+        }
+        for dx in 0..w as i64 {
+            let tx = x + dx;
+            if tx < 0 || tx >= target.width() as i64 {
+                continue;
+            }
+            blend(target, tx as u32, ty as u32, colour, 1.0);
+        }
+    }
+}
+
+/// Composites an image onto the target, clipped to it.
+fn overlay(target: &mut RgbaImage, source: &RgbaImage, x: i64, y: i64) {
+    for (sx, sy, pixel) in source.enumerate_pixels() {
+        let tx = x + sx as i64;
+        let ty = y + sy as i64;
+        if tx < 0 || ty < 0 || tx >= target.width() as i64 || ty >= target.height() as i64 {
+            continue;
+        }
+        let colour = Color {
+            r: pixel.0[0],
+            g: pixel.0[1],
+            b: pixel.0[2],
+            a: 255,
+        };
+        blend(target, tx as u32, ty as u32, colour, pixel.0[3] as f32 / 255.0);
+    }
 }
 
 /// Measures the caption without drawing it, in pixels: (width, height) of the
@@ -345,6 +463,7 @@ mod tests {
             outline_px: 5.0,
             margin_px: 20.0,
             corner,
+            flag: FlagPlacement::Off,
         }
     }
 
@@ -381,7 +500,7 @@ mod tests {
     fn empty_text_draws_nothing() {
         let Some(font) = test_font() else { return };
         let mut img = gray_canvas(200, 100);
-        assert!(!draw_caption(&mut img, "   ", &font, &style(Corner::BottomRight)));
+        assert!(!draw_caption(&mut img, "   ", &font, &style(Corner::BottomRight), None));
         assert!(ink_bbox(&img).is_none());
     }
 
@@ -389,7 +508,7 @@ mod tests {
     fn draws_both_a_fill_and_an_outline() {
         let Some(font) = test_font() else { return };
         let mut img = gray_canvas(600, 200);
-        assert!(draw_caption(&mut img, "Paris, France", &font, &style(Corner::BottomRight)));
+        assert!(draw_caption(&mut img, "Paris, France", &font, &style(Corner::BottomRight), None));
 
         let dark = count_near(&img, Color::BLACK, 40);
         let light = count_near(&img, Color::WHITE, 40);
@@ -401,7 +520,7 @@ mod tests {
     fn the_outline_surrounds_the_fill_on_every_side() {
         let Some(font) = test_font() else { return };
         let mut img = gray_canvas(600, 200);
-        draw_caption(&mut img, "H", &font, &style(Corner::TopLeft));
+        draw_caption(&mut img, "H", &font, &style(Corner::TopLeft), None);
 
         let is_background = |x: i64, y: i64| {
             if x < 0 || y < 0 || x >= img.width() as i64 || y >= img.height() as i64 {
@@ -439,7 +558,7 @@ mod tests {
         let (w, h) = (800u32, 400u32);
         for corner in Corner::ALL {
             let mut img = gray_canvas(w, h);
-            assert!(draw_caption(&mut img, "Oct '25", &font, &style(corner)));
+            assert!(draw_caption(&mut img, "Oct '25", &font, &style(corner), None));
             let (x0, y0, x1, y1) = ink_bbox(&img).expect("something was drawn");
             let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
             if corner.is_right() {
@@ -460,7 +579,7 @@ mod tests {
         let Some(font) = test_font() else { return };
         let mut img = gray_canvas(800, 300);
         let s = style(Corner::BottomRight);
-        draw_caption(&mut img, "Moscow, Russia, Oct '25", &font, &s);
+        draw_caption(&mut img, "Moscow, Russia, Oct '25", &font, &s, None);
         let (x0, y0, x1, y1) = ink_bbox(&img).unwrap();
         let margin = s.margin_px as u32;
         // One pixel of slack for the rounding of the placement offset.
@@ -494,7 +613,7 @@ mod tests {
             outline_px: 0.0,
             ..style(Corner::TopLeft)
         };
-        assert!(draw_caption(&mut img, "no outline", &font, &s));
+        assert!(draw_caption(&mut img, "no outline", &font, &s, None));
         assert!(count_near(&img, Color::WHITE, 40) == 0, "outline was drawn anyway");
         assert!(count_near(&img, Color::BLACK, 40) > 100);
     }
@@ -508,7 +627,7 @@ mod tests {
             margin_px: 0.0,
             ..style(Corner::BottomRight)
         };
-        draw_caption(&mut img, "enormous caption text", &font, &s);
+        draw_caption(&mut img, "enormous caption text", &font, &s, None);
     }
 
     #[test]
@@ -523,7 +642,7 @@ mod tests {
     fn cyrillic_renders() {
         let Some(font) = test_font() else { return };
         let mut img = gray_canvas(600, 200);
-        assert!(draw_caption(&mut img, "Москва, Россия", &font, &style(Corner::BottomRight)));
+        assert!(draw_caption(&mut img, "Москва, Россия", &font, &style(Corner::BottomRight), None));
         assert!(ink_bbox(&img).is_some());
     }
 
@@ -550,7 +669,7 @@ mod tests {
             outline_px: 0.0,
             ..style(Corner::TopLeft)
         };
-        assert!(draw_caption(&mut img, "Fringe", &font, &s));
+        assert!(draw_caption(&mut img, "Fringe", &font, &s, None));
 
         let touched: Vec<_> = img.pixels().filter(|p| p.0[3] > 0).collect();
         assert!(!touched.is_empty());
@@ -561,6 +680,179 @@ mod tests {
                 "edge pixel was darkened: {:?}",
                 p.0
             );
+        }
+    }
+
+    /// The French flag's red band. Its blue is a dark navy in this drawing, and
+    /// the caption is only ever black fill and white outline, so red is the one
+    /// colour that can only have come from a flag.
+    fn is_flag_colour(pixel: &Rgba<u8>) -> bool {
+        pixel.0[0] > 150 && pixel.0[2] < 90
+    }
+
+    fn flag_pixels(img: &RgbaImage) -> usize {
+        img.pixels().filter(|p| is_flag_colour(p)).count()
+    }
+
+    fn with_flag(corner: Corner, placement: FlagPlacement) -> StampStyle {
+        StampStyle {
+            flag: placement,
+            ..style(corner)
+        }
+    }
+
+    #[test]
+    fn a_flag_is_drawn_beside_the_words() {
+        let Some(font) = test_font() else { return };
+        let mut without = gray_canvas(700, 200);
+        let mut with = gray_canvas(700, 200);
+
+        draw_caption(&mut without, "Paris", &font, &style(Corner::TopLeft), Some("fr"));
+        draw_caption(
+            &mut with,
+            "Paris",
+            &font,
+            &with_flag(Corner::TopLeft, FlagPlacement::Left),
+            Some("fr"),
+        );
+
+        // The flag only appears once the setting asks for it.
+        let plain = ink_bbox(&without).expect("words were drawn");
+        let flagged = ink_bbox(&with).expect("words were drawn");
+        assert!(
+            flagged.2 - flagged.0 > plain.2 - plain.0 + 20,
+            "the block should be wider with a flag: {flagged:?} vs {plain:?}"
+        );
+
+        assert!(flag_pixels(&with) > 100, "no flag colour anywhere");
+        assert_eq!(flag_pixels(&without), 0, "a flag appeared without being asked for");
+    }
+
+    #[test]
+    fn the_flag_takes_the_side_it_is_told_to() {
+        let Some(font) = test_font() else { return };
+        let flag_centre = |img: &RgbaImage| -> f32 {
+            let mut sum = 0.0;
+            let mut count = 0.0;
+            for (x, _, p) in img.enumerate_pixels() {
+                if is_flag_colour(p) {
+                    sum += x as f32;
+                    count += 1.0;
+                }
+            }
+            if count == 0.0 {
+                f32::NAN
+            } else {
+                sum / count
+            }
+        };
+
+        let mut left = gray_canvas(700, 200);
+        draw_caption(
+            &mut left,
+            "Paris",
+            &font,
+            &with_flag(Corner::TopLeft, FlagPlacement::Left),
+            Some("fr"),
+        );
+        let mut right = gray_canvas(700, 200);
+        draw_caption(
+            &mut right,
+            "Paris",
+            &font,
+            &with_flag(Corner::TopLeft, FlagPlacement::Right),
+            Some("fr"),
+        );
+
+        let (l, r) = (flag_centre(&left), flag_centre(&right));
+        assert!(l.is_finite() && r.is_finite(), "a flag should be present in both");
+        assert!(r > l + 20.0, "the flag did not move to the other side: {l} then {r}");
+    }
+
+    /// The requested behaviour: a two-line caption gets a flag two lines tall.
+    #[test]
+    fn the_flag_spans_however_many_lines_there_are() {
+        let Some(font) = test_font() else { return };
+        let flag_height = |text: &str| -> u32 {
+            let mut img = gray_canvas(700, 400);
+            draw_caption(
+                &mut img,
+                text,
+                &font,
+                &with_flag(Corner::TopLeft, FlagPlacement::Left),
+                Some("fr"),
+            );
+            // The flag is the only red thing, so its rows are the flag's.
+            let rows: Vec<u32> = img
+                .enumerate_pixels()
+                .filter(|(_, _, p)| is_flag_colour(p))
+                .map(|(_, y, _)| y)
+                .collect();
+            match (rows.iter().min(), rows.iter().max()) {
+                (Some(a), Some(b)) => b - a + 1,
+                _ => 0,
+            }
+        };
+
+        let one = flag_height("Paris");
+        let two = flag_height("Paris\nOct '25");
+        assert!(one > 0 && two > 0, "flags should have been drawn");
+        assert!(
+            two > one + one / 2,
+            "two lines should give a much taller flag: {one} then {two}"
+        );
+    }
+
+    #[test]
+    fn a_flag_alone_is_drawn_when_there_are_no_words() {
+        let Some(font) = test_font() else { return };
+        let mut img = gray_canvas(400, 200);
+        assert!(draw_caption(
+            &mut img,
+            "",
+            &font,
+            &with_flag(Corner::BottomRight, FlagPlacement::Left),
+            Some("fr"),
+        ));
+        assert!(flag_pixels(&img) > 20, "the flag should be there on its own");
+    }
+
+    #[test]
+    fn nothing_at_all_is_still_nothing() {
+        let Some(font) = test_font() else { return };
+        let mut img = gray_canvas(400, 200);
+        // No words, and a country with no flag.
+        assert!(!draw_caption(
+            &mut img,
+            "",
+            &font,
+            &with_flag(Corner::TopLeft, FlagPlacement::Left),
+            Some("zz"),
+        ));
+        // No words and no country.
+        assert!(!draw_caption(
+            &mut img,
+            "  ",
+            &font,
+            &with_flag(Corner::TopLeft, FlagPlacement::Left),
+            None,
+        ));
+        assert!(ink_bbox(&img).is_none());
+    }
+
+    #[test]
+    fn a_flagged_caption_still_stays_inside_the_margin() {
+        let Some(font) = test_font() else { return };
+        for corner in Corner::ALL {
+            let mut img = gray_canvas(800, 300);
+            let s = with_flag(corner, FlagPlacement::Left);
+            draw_caption(&mut img, "Paris, Oct '25", &font, &s, Some("fr"));
+            let (x0, y0, x1, y1) = ink_bbox(&img).expect("something was drawn");
+            let margin = s.margin_px as u32;
+            assert!(x0 + 1 >= margin, "{corner:?}: left {x0} inside {margin}");
+            assert!(y0 + 1 >= margin, "{corner:?}: top {y0} inside {margin}");
+            assert!(x1 <= 800 - margin + 1, "{corner:?}: right {x1}");
+            assert!(y1 <= 300 - margin + 1, "{corner:?}: bottom {y1}");
         }
     }
 

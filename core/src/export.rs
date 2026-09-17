@@ -28,6 +28,8 @@ pub struct CaptionRender<'a> {
     pub text: &'a str,
     pub font: &'a FontVec,
     pub config: &'a CaptionConfig,
+    /// ISO 3166-1 alpha-2, for the flag. `None` draws no flag.
+    pub flag_code: Option<&'a str>,
 }
 
 /// Cuts `crop` out of `src` onto a background, and stamps the caption.
@@ -76,7 +78,7 @@ pub fn compose(
     if let Some(c) = caption {
         if c.config.enabled {
             let style = StampStyle::from_config(c.config, cw, ch);
-            stamp::draw_caption(&mut canvas, c.text, c.font, &style);
+            stamp::draw_caption(&mut canvas, c.text, c.font, &style, c.flag_code);
         }
     }
 
@@ -102,6 +104,7 @@ pub fn export(
     config: &Config,
     caption_text: &str,
     font: Option<&FontVec>,
+    flag_code: Option<&str>,
 ) -> Result<ExportOutcome> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("creating {}", output_dir.display()))?;
@@ -112,6 +115,7 @@ pub fn export(
         text: caption_text,
         font,
         config: &config.caption,
+        flag_code,
     });
     let canvas = compose(&full, crop_full_res, config.background, caption);
 
@@ -177,6 +181,19 @@ impl CaptionFields {
             (true, false) => self.country.clone(),
             (true, true) => String::new(),
         }
+    }
+}
+
+/// The country code the flag should be drawn from.
+///
+/// A hand-typed country has to be turned back into a code, or overriding the
+/// country to "France" would silently drop the flag.
+pub fn flag_code(place: Option<&Place>, country_override: Option<&str>) -> Option<String> {
+    match country_override.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(name) => crate::geo::CityDb::embedded()
+            .country_code_for_name(name)
+            .map(str::to_string),
+        None => place.map(|p| p.country_code.clone()),
     }
 }
 

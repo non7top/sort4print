@@ -9,3 +9,4 @@ image.workspace = true
 kamadak-exif.workspace = true
 ab_glyph.workspace = true
 ttf-parser.workspace = true
+resvg.workspace = true
