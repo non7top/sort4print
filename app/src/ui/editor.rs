@@ -428,7 +428,7 @@ fn view_zoom(
 /// printed"; anything else is the ordinary dark surround.
 fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
     if picked {
-        crate::ui::PICKED_GROUND
+        crate::ui::CANVAS_SURROUND_PICKED
     } else {
         ui.visuals().extreme_bg_color
     }
