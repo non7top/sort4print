@@ -313,7 +313,7 @@ fn canvas(app: &mut Sort4Print, ui: &mut egui::Ui) {
         egui::Color32::WHITE,
     );
 
-    dim_outside(&painter, area, crop_rect);
+    dim_outside(&painter, image_rect, crop_rect);
     draw_caption_overlay(app, ui, index, crop_rect, &image);
 
     // Picked photos get a green window, so the decision is visible without
