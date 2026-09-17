@@ -3,10 +3,19 @@
 use sort4print_core::config::{NavMode, RATIO_PRESETS};
 
 use crate::app::Sort4Print;
-use crate::ui::{folder_label, ACCENT};
+use crate::ui::theme::{self, Tone};
+use crate::ui::{folder_label, OK_GREEN};
 
 pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
     egui::Panel::top("toolbar").show(ui, |ui| {
+        let bar = ui.available_rect_before_wrap();
+        let palette = theme::Palette::of(app.config.theme);
+        theme::vertical_gradient(
+            &ui.painter_at(bar),
+            bar,
+            palette.surface,
+            palette.surface_alt,
+        );
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             source_folder(app, ui);
@@ -19,7 +28,14 @@ pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
             export(app, ui);
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.toggle_value(&mut app.show_settings, "⚙ Settings");
+                let tone = if app.show_settings {
+                    Tone::Primary
+                } else {
+                    Tone::Neutral
+                };
+                if theme::button(ui, "⚙  Settings", tone).clicked() {
+                    app.show_settings = !app.show_settings;
+                }
             });
         });
         ui.add_space(4.0);
@@ -28,8 +44,7 @@ pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
 fn source_folder(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let label = folder_label(&app.config.source_dir, "Choose photos…");
-    if ui
-        .button(format!("📂 {label}"))
+    if theme::button(ui, &format!("📂  {label}"), Tone::Primary)
         .on_hover_text("The folder of photos to go through")
         .clicked()
     {
@@ -45,8 +60,7 @@ fn source_folder(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
 fn output_folder(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let label = folder_label(&app.config.output_dir, "Choose destination…");
-    if ui
-        .button(format!("💾 {label}"))
+    if theme::button(ui, &format!("💾  {label}"), Tone::Neutral)
         .on_hover_text("Where the cropped prints are written")
         .clicked()
     {
@@ -127,19 +141,20 @@ fn navigation(app: &mut Sort4Print, ui: &mut egui::Ui) {
                  pass, once the obvious ones are done"
             }
         };
-        if ui
-            .selectable_value(&mut nav, mode, format!("{} ({count})", mode.label()))
+        let chosen = nav == mode;
+        if theme::segment(ui, &format!("{} ({count})", mode.label()), chosen)
             .on_hover_text(hint)
             .clicked()
-            && app.config.nav != nav
+            && !chosen
         {
-            app.config.nav = nav;
+            nav = mode;
+            app.config.nav = mode;
             app.config_dirty = true;
         }
     }
 
     if selected > 0 {
-        ui.colored_label(ACCENT, format!("✔ {selected}"));
+        ui.colored_label(OK_GREEN, format!("✔ {selected}"));
     }
 }
 
@@ -147,14 +162,20 @@ fn export(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let running = app.export_run.as_ref().map(|r| r.running).unwrap_or(false);
     let count = app.selected_count();
 
-    let button = egui::Button::new(if running {
+    let label = if running {
         "Exporting…".to_string()
     } else {
-        format!("⬇ Export {count}")
-    });
+        format!("⬇  Export {count}")
+    };
 
     let enabled = app.can_export();
-    let response = ui.add_enabled(enabled, button);
+    let response = if enabled {
+        theme::button(ui, &label, Tone::Positive)
+    } else {
+        // A control that cannot be used says so by looking inert, rather than
+        // by looking the same and then doing nothing.
+        ui.add_enabled(false, egui::Button::new(label))
+    };
     if response.clicked() {
         app.start_export();
     }

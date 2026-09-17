@@ -7,21 +7,20 @@ pub mod editor;
 pub mod filmstrip;
 pub mod settings;
 pub mod status_bar;
+pub mod theme;
 pub mod toolbar;
 
 use egui::Color32;
 
-/// Accent used for the crop window and the selected state.
-pub const ACCENT: Color32 = Color32::from_rgb(255, 176, 32);
-pub const OK_GREEN: Color32 = Color32::from_rgb(102, 187, 106);
+/// The crop window. Amber reads against both palettes and against a
+/// photograph, which the interface accent would not.
+pub const ACCENT: Color32 = theme::CROP_AMBER;
+pub const OK_GREEN: Color32 = theme::PICKED_GREEN;
 
-/// Ground behind a picked photo, in the main view and in the list.
-///
-/// Deliberately a hint rather than a wash. The signal has to be readable at a
-/// glance without the eye being dragged to it, and nothing green may fall on the
-/// photograph itself — a tint over the picture misrepresents the thing you are
-/// judging.
-pub const PICKED_GROUND: Color32 = Color32::from_rgb(17, 30, 21);
+/// Ground behind a picked photo in the main view. A hint, never a wash: no
+/// green may fall on the photograph, since a tint misrepresents the thing being
+/// judged.
+pub const PICKED_GROUND: Color32 = theme::CANVAS_PICKED;
 
 pub fn folder_label(path: &Option<std::path::PathBuf>, empty: &str) -> String {
     match path {

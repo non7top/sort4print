@@ -7,6 +7,7 @@ use sort4print_core::geo::CityDb;
 
 use crate::app::{Sort4Print, SettingsTab};
 use crate::ui::editor::caption_swatch;
+use crate::ui::theme::{self, Tone};
 
 pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
     egui::Panel::right("settings")
@@ -17,10 +18,12 @@ pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    this_picture(app, ui);
-                    ui.separator();
+                    theme::group(ui, "This picture", theme::ACCENT, |ui| {
+                        this_picture(app, ui);
+                    });
+                    ui.add_space(4.0);
                     tabs(app, ui);
-                    ui.separator();
+                    ui.add_space(2.0);
                     match app.settings_tab {
                         SettingsTab::Caption => caption_tab(app, ui),
                         SettingsTab::Date => date_tab(app, ui),
@@ -35,13 +38,15 @@ pub fn show(app: &mut Sort4Print, ui: &mut egui::Ui) {
 fn tabs(app: &mut Sort4Print, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         for (tab, label) in [
-            (SettingsTab::Caption, "Caption & font"),
+            (SettingsTab::Caption, "Caption"),
             (SettingsTab::Date, "Date"),
             (SettingsTab::Output, "Output"),
             (SettingsTab::Performance, "Speed"),
             (SettingsTab::About, "About"),
         ] {
-            ui.selectable_value(&mut app.settings_tab, tab, label);
+            if theme::segment(ui, label, app.settings_tab == tab).clicked() {
+                app.settings_tab = tab;
+            }
         }
     });
 }
@@ -49,9 +54,7 @@ fn tabs(app: &mut Sort4Print, ui: &mut egui::Ui) {
 // ---- current picture -----------------------------------------------------
 
 fn this_picture(app: &mut Sort4Print, ui: &mut egui::Ui) {
-    ui.add_space(6.0);
-    ui.heading("This picture");
-
+    // The group around this one supplies the title.
     let Some(index) = (!app.entries.is_empty()).then_some(app.current) else {
         ui.weak("Nothing open.");
         return;
@@ -565,7 +568,7 @@ fn output_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
             None => ui.weak("not chosen"),
         };
     });
-    if ui.button("Choose…").clicked() {
+    if theme::button(ui, "📂  Choose…", Tone::Primary).clicked() {
         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
             app.config.output_dir = Some(dir);
             changed = true;
@@ -624,6 +627,30 @@ fn output_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
 fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
     let mut changed = false;
+
+    theme::group(ui, "Appearance", theme::ACCENT_DARK, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Window");
+            for option in sort4print_core::config::Theme::ALL {
+                if theme::segment(ui, option.label(), app.config.theme == option).clicked()
+                    && app.config.theme != option
+                {
+                    app.config.theme = option;
+                    changed = true;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "The area a photograph is judged against stays dark either way: a \
+                 light surround changes how you read the exposure of the picture \
+                 sitting on it.",
+            )
+            .small()
+            .weak(),
+        );
+    });
+    ui.add_space(6.0);
 
     ui.label("Background loading");
     ui.label(
@@ -731,11 +758,10 @@ fn performance_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
                 .weak(),
         );
         ui.horizontal(|ui| {
-            if ui.button("Read the whole folder").clicked() {
+            if theme::button(ui, "⟳  Read the whole folder", Tone::Caution).clicked() {
                 app.start_scan_all();
             }
-            if ui
-                .button("Empty the cache")
+            if theme::button(ui, "🗑  Empty the cache", Tone::Danger)
                 .on_hover_text("Only discards decoded copies; your photos and notes are untouched")
                 .clicked()
             {
@@ -799,8 +825,7 @@ fn about_tab(app: &mut Sort4Print, ui: &mut egui::Ui) {
         std::path::Path::new(&crate::diagnostics::log_path_display()),
     );
 
-    if ui
-        .button("Save now")
+    if theme::button(ui, "💾  Save now", Tone::Positive)
         .on_hover_text("Both files are written as you go; this forces it")
         .clicked()
     {

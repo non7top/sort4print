@@ -13,7 +13,8 @@
 //! not turn into eleven thousand decodes.
 
 use crate::app::Sort4Print;
-use crate::ui::{ACCENT, OK_GREEN};
+use crate::ui::theme::{self, Tone};
+use crate::ui::OK_GREEN;
 
 const ROW_HEIGHT: f32 = 62.0;
 const THUMB_WIDTH: f32 = 72.0;
@@ -64,19 +65,19 @@ fn header(app: &mut Sort4Print, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         let mut bulk_change = false;
-        if ui.small_button("All").clicked() {
+        if theme::button(ui, "All", Tone::Neutral).clicked() {
             for entry in &mut app.entries {
                 entry.selected = true;
             }
             bulk_change = true;
         }
-        if ui.small_button("None").clicked() {
+        if theme::button(ui, "None", Tone::Neutral).clicked() {
             for entry in &mut app.entries {
                 entry.selected = false;
             }
             bulk_change = true;
         }
-        if ui.small_button("Invert").clicked() {
+        if theme::button(ui, "Invert", Tone::Neutral).clicked() {
             for entry in &mut app.entries {
                 entry.selected = !entry.selected;
             }
@@ -99,13 +100,12 @@ fn header(app: &mut Sort4Print, ui: &mut egui::Ui) {
                     .desired_width(150.0)
                     .text(format!("{}/{}", scan.next, scan.total)),
             );
-            if ui.small_button("Stop").clicked() {
+            if theme::button(ui, "Stop", Tone::Danger).clicked() {
                 app.stop_scan_all();
             }
         }
         None => {
-            if ui
-                .small_button("Read all")
+            if theme::button(ui, "⟳  Read all", Tone::Caution)
                 .on_hover_text(
                     "Go through the whole folder once, filling the cache, so that \
                      browsing afterwards waits for nothing. Runs in the background \
@@ -146,12 +146,16 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
 
     let painter = ui.painter_at(rect);
     let body = rect.shrink2(egui::vec2(PAD, 3.0));
+    let palette = theme::Palette::of(app.config.theme);
 
+    // Three states, three grounds: the one being edited, one already picked,
+    // and the rest. Striping the rest keeps a long list countable.
     if is_current {
-        painter.rect_filled(rect.shrink(1.0), 3.0, ui.visuals().selection.bg_fill);
+        painter.rect_filled(rect.shrink(1.0), 2.0, theme::ACCENT);
     } else if selected {
-        // A picked photo reads as picked in the list too, not only in the view.
-        painter.rect_filled(rect.shrink(1.0), 3.0, crate::ui::PICKED_GROUND);
+        painter.rect_filled(rect.shrink(1.0), 2.0, palette.picked_row);
+    } else if index % 2 == 1 {
+        painter.rect_filled(rect.shrink(1.0), 0.0, ui.visuals().faint_bg_color);
     }
 
     // Thumbnail, letterboxed into its slot so nothing is stretched.
@@ -179,8 +183,8 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
     // Name, and whatever else is worth saying about this one.
     let text_left = slot.right() + 6.0;
     let mut line_y = body.top() + 2.0;
-    let name_colour = if selected {
-        ACCENT
+    let name_colour = if is_current {
+        egui::Color32::WHITE
     } else {
         ui.visuals().text_color()
     };
@@ -199,7 +203,13 @@ fn row(app: &mut Sort4Print, ui: &mut egui::Ui, index: usize) {
             egui::Align2::LEFT_TOP,
             "✔ picked",
             egui::FontId::proportional(10.5),
-            OK_GREEN,
+            if is_current {
+                egui::Color32::from_white_alpha(220)
+            } else if palette.dark {
+                OK_GREEN
+            } else {
+                egui::Color32::from_rgb(30, 110, 40)
+            },
         );
         line_y += 13.0;
     }
