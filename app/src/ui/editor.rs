@@ -438,7 +438,7 @@ fn view_zoom(
 fn surround_colour(ui: &egui::Ui, picked: bool) -> egui::Color32 {
     let _ = ui;
     if picked {
-        crate::ui::theme::CANVAS_PICKED
+        crate::ui::theme::CANVAS_SURROUND_PICKED
     } else {
         crate::ui::theme::CANVAS
     }
