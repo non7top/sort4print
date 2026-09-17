@@ -41,6 +41,11 @@ pub const CANVAS: Color32 = Color32::from_rgb(38, 38, 40);
 /// The same, for a picked photo: a hint of green, never enough to cast on the
 /// picture.
 pub const CANVAS_PICKED: Color32 = Color32::from_rgb(20, 46, 28);
+/// The picked-state canvas surround specifically. Brighter than
+/// `CANVAS_PICKED`: the surround is the one place this signal has room to be
+/// seen clearly rather than as a thin edge, so it can afford more saturation
+/// than a hint.
+pub const CANVAS_SURROUND_PICKED: Color32 = Color32::from_rgb(19, 73, 37);
 
 pub struct Palette {
     pub dark: bool,
