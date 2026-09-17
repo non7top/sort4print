@@ -221,6 +221,47 @@ fn cached_dims_and_meta(cache: &DiskCache, key: &str, path: &Path) -> Option<(u3
     Some((full_w, full_h, meta))
 }
 
+/// A `View` preview at `max_px`, built by shrinking a *larger* size that is
+/// already cached, rather than reopening the original. `None` when nothing
+/// bigger is cached either, so the caller falls through to decoding the
+/// source.
+///
+/// This is what lets a legacy entry cached at an old, wider bucket (or one
+/// simply cached back when the editor pane was wider) converge on the
+/// smaller "Read all"/quick-view size for free: the pixels it would decode
+/// to are already sitting on disk, just at a size nobody asked to keep.
+fn downscale_from_larger_cached(
+    cache: &DiskCache,
+    key: &str,
+    max_px: u32,
+    path: &Path,
+) -> Option<Preview> {
+    let bytes = DiskCache::SIZE_BUCKETS
+        .iter()
+        .copied()
+        .filter(|&size| size > max_px)
+        .find_map(|size| cache.read(key, Kind::View, size))?;
+    let (full_w, full_h, meta) = cached_dims_and_meta(cache, key, path)?;
+    let image = decode_bytes(&bytes).ok()?;
+    let shrunk = shrink_to(image, max_px).into_rgba8();
+
+    if let Ok(out) = encode_jpeg(&shrunk, CACHE_QUALITY) {
+        let _ = cache.write(key, Kind::View, max_px, &out);
+    }
+    let scale = if full_w > 0 {
+        shrunk.width() as f64 / full_w as f64
+    } else {
+        1.0
+    };
+    Some(Preview {
+        rgba: shrunk,
+        full_w,
+        full_h,
+        scale,
+        meta,
+    })
+}
+
 /// A preview, from the cache when it is there and from the original when it is
 /// not — in which case the result is written to the cache on the way out.
 ///
@@ -252,6 +293,9 @@ pub fn load_preview_cached(
                     });
                 }
             }
+        }
+        if let Some(preview) = downscale_from_larger_cached(cache, key, max_px, path) {
+            return Ok(preview);
         }
     }
 
@@ -525,5 +569,51 @@ mod tests {
         let mut bytes = encode_meta(100, 100, &PhotoMeta::default());
         bytes[0] = META_VERSION.wrapping_add(1);
         assert!(decode_meta(&bytes).is_none());
+    }
+
+    fn scratch_cache(name: &str) -> (std::path::PathBuf, DiskCache) {
+        let dir = std::env::temp_dir().join(format!(
+            "sort4print-loader-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = DiskCache::new(dir.join("cache"), 10_000_000);
+        (dir, cache)
+    }
+
+    #[test]
+    fn a_missing_size_is_served_by_shrinking_a_larger_cached_entry() {
+        let (dir, cache) = scratch_cache("downscale-hit");
+        // A path that does not exist: the point of this test is that the
+        // downscale path never has to open it.
+        let path = dir.join("nonexistent.jpg");
+        let key = "abc0000000000000";
+
+        let big = RgbaImage::from_pixel(1800, 1200, Rgba([10, 20, 30, 255]));
+        let bytes = encode_jpeg(&big, CACHE_QUALITY).unwrap();
+        cache.write(key, Kind::View, 1800, &bytes).unwrap();
+        cache
+            .write_meta(key, &encode_meta(1800, 1200, &PhotoMeta::default()))
+            .unwrap();
+
+        let preview = downscale_from_larger_cached(&cache, key, 1000, &path)
+            .expect("a larger cached entry should serve a smaller request");
+        assert_eq!((preview.full_w, preview.full_h), (1800, 1200));
+        assert!(preview.rgba.width() <= 1000 && preview.rgba.height() <= 1000);
+        // The smaller size is now cached too, produced from the larger entry
+        // alone rather than by reopening the (nonexistent) original.
+        assert!(cache.contains(key, Kind::View, 1000));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_larger_cached_means_no_downscale_is_produced() {
+        let (dir, cache) = scratch_cache("downscale-miss");
+        let path = dir.join("nonexistent.jpg");
+        assert!(downscale_from_larger_cached(&cache, "0000000000000000", 1000, &path).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

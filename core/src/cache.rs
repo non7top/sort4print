@@ -201,6 +201,15 @@ impl DiskCache {
     /// had.
     pub const SIZE_BUCKETS: &'static [u32] = &[1000, 1400, 1800, 2200, 2800, 3600];
 
+    /// The size ordinary browsing and "Read all" target, decoupled from
+    /// whatever the editor pane's width happens to be — that follows the
+    /// window instead (see [`bucket_for`]). Deliberately the smallest
+    /// bucket, so a quick-view entry and the editor's own preview on a
+    /// narrow window are the same cache entry rather than two.
+    ///
+    /// [`bucket_for`]: DiskCache::bucket_for
+    pub const QUICK_VIEW_PX: u32 = Self::SIZE_BUCKETS[0];
+
     /// The bucket that covers `wanted`, never exceeding `cap`.
     pub fn bucket_for(wanted: u32, cap: u32) -> u32 {
         let cap = cap.max(Self::SIZE_BUCKETS[0]);

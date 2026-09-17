@@ -666,7 +666,12 @@ impl Sort4Print {
             return;
         };
         let (mut next, total) = (scan.next, scan.total);
-        let max_px = self.preview_target_px();
+        // Fixed rather than `preview_target_px()`: a background pre-fill has
+        // no picture in view to size itself to, and letting it follow
+        // whatever the editor pane happened to be last is how the cache
+        // ended up mostly holding sizes wider than anyone actually needed
+        // for quick browsing.
+        let max_px = sort4print_core::cache::DiskCache::QUICK_VIEW_PX;
 
         let mut checked = 0;
         while self.prefetch.queued() < IN_FLIGHT && next < total && checked < MAX_CHECKED {
