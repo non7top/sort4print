@@ -40,7 +40,7 @@ pub const DANGER_RED: Color32 = Color32::from_rgb(196, 62, 54);
 pub const CANVAS: Color32 = Color32::from_rgb(38, 38, 40);
 /// The same, for a picked photo: a hint of green, never enough to cast on the
 /// picture.
-pub const CANVAS_PICKED: Color32 = Color32::from_rgb(28, 46, 33);
+pub const CANVAS_PICKED: Color32 = Color32::from_rgb(20, 46, 28);
 
 pub struct Palette {
     pub dark: bool,
