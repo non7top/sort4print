@@ -657,6 +657,10 @@ impl Sort4Print {
         // Small enough that the queue never builds up, large enough to keep
         // every worker busy.
         const IN_FLIGHT: usize = 24;
+        // A re-run over an already-fully-cached library must not stall a
+        // frame just to confirm "yep, still cached" for every entry — cap how
+        // many of those cheap, network-free checks one pump does.
+        const MAX_CHECKED: usize = 500;
 
         let Some(scan) = self.scan_all.as_ref() else {
             return;
@@ -664,12 +668,19 @@ impl Sort4Print {
         let (mut next, total) = (scan.next, scan.total);
         let max_px = self.preview_target_px();
 
-        while self.prefetch.queued() < IN_FLIGHT && next < total {
+        let mut checked = 0;
+        while self.prefetch.queued() < IN_FLIGHT && next < total && checked < MAX_CHECKED {
             let Some(entry) = self.entries.get(next) else {
                 break;
             };
             let path = entry.path.clone();
             next += 1;
+            checked += 1;
+
+            if self.already_cached(&path, max_px) {
+                continue;
+            }
+
             // Far behind anything the user is waiting on.
             self.prefetch.request(&path, JobKind::Thumb, 220, 50_000);
             self.prefetch
@@ -697,6 +708,22 @@ impl Sort4Print {
             };
             crate::diagnostics::log(&self.status.clone());
         }
+    }
+
+    /// True when both sizes "Read all" would dispatch for this photo are
+    /// already on disk — a stat and two file-exists checks, never the
+    /// original, so a re-run over an unchanged library costs no network at
+    /// all instead of a round trip per file to reconfirm what is already
+    /// cached.
+    fn already_cached(&self, path: &Path, max_px: u32) -> bool {
+        let Some(cache) = self.disk_cache.as_ref() else {
+            return false;
+        };
+        let Some(key) = sort4print_core::cache::DiskCache::key_for(path) else {
+            return false;
+        };
+        cache.contains(&key, sort4print_core::cache::Kind::Thumb, 220)
+            && cache.contains(&key, sort4print_core::cache::Kind::View, max_px)
     }
 
     pub fn request_thumb(&mut self, index: usize) {

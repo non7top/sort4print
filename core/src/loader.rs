@@ -123,6 +123,104 @@ pub fn upright_dimensions(path: &Path) -> Result<(u32, u32)> {
 /// worse than a fresh decode, low enough that entries stay small.
 const CACHE_QUALITY: u8 = 88;
 
+/// Version byte for the meta sidecar's layout, so a future format change can
+/// tell an old sidecar apart from a corrupt one instead of misreading it.
+const META_VERSION: u8 = 1;
+
+/// Packs a hit's full size and EXIF fields into the sidecar written beside a
+/// cached JPEG, so a later hit can read them back instead of reopening the
+/// original. See [`decode_meta`].
+fn encode_meta(full_w: u32, full_h: u32, meta: &PhotoMeta) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.push(META_VERSION);
+    out.extend_from_slice(&full_w.to_le_bytes());
+    out.extend_from_slice(&full_h.to_le_bytes());
+    out.push(meta.orientation.as_u8());
+    match meta.date {
+        Some(date) => {
+            out.push(1);
+            out.extend_from_slice(&date.year.to_le_bytes());
+            out.extend_from_slice(&date.month.to_le_bytes());
+            out.extend_from_slice(&date.day.to_le_bytes());
+            out.extend_from_slice(&date.hour.to_le_bytes());
+            out.extend_from_slice(&date.minute.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    match meta.gps {
+        Some((lat, lon)) => {
+            out.push(1);
+            out.extend_from_slice(&lat.to_le_bytes());
+            out.extend_from_slice(&lon.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// The inverse of [`encode_meta`]. `None` on anything unrecognised — a
+/// version mismatch or truncated file — so the caller falls back to the
+/// original exactly as it would for a missing sidecar.
+fn decode_meta(bytes: &[u8]) -> Option<(u32, u32, PhotoMeta)> {
+    let mut pos = 0;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let slice = bytes.get(*pos..*pos + n)?;
+        *pos += n;
+        Some(slice)
+    };
+
+    if *take(&mut pos, 1)?.first()? != META_VERSION {
+        return None;
+    }
+    let full_w = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?);
+    let full_h = u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?);
+    let orientation = Orientation::from_exif(*take(&mut pos, 1)?.first()? as u32);
+
+    let date = if *take(&mut pos, 1)?.first()? == 1 {
+        Some(crate::datefmt::PhotoDate {
+            year: i32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?),
+            month: u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?),
+            day: u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?),
+            hour: u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?),
+            minute: u32::from_le_bytes(take(&mut pos, 4)?.try_into().ok()?),
+        })
+    } else {
+        None
+    };
+
+    let gps = if *take(&mut pos, 1)?.first()? == 1 {
+        let lat = f64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        let lon = f64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+        Some((lat, lon))
+    } else {
+        None
+    };
+
+    Some((
+        full_w,
+        full_h,
+        PhotoMeta {
+            date,
+            gps,
+            orientation,
+        },
+    ))
+}
+
+/// Reads a cache hit's size and EXIF fields from its sidecar, without opening
+/// the original. For a hit cached before the sidecar existed, falls back to
+/// the original once and backfills the sidecar so that read is the last one —
+/// the existing image entry is never rewritten or regenerated.
+fn cached_dims_and_meta(cache: &DiskCache, key: &str, path: &Path) -> Option<(u32, u32, PhotoMeta)> {
+    if let Some(parsed) = cache.read_meta(key).and_then(|bytes| decode_meta(&bytes)) {
+        return Some(parsed);
+    }
+    let meta = exif_data::read_meta(path);
+    let (full_w, full_h) = upright_dimensions(path).ok()?;
+    let _ = cache.write_meta(key, &encode_meta(full_w, full_h, &meta));
+    Some((full_w, full_h, meta))
+}
+
 /// A preview, from the cache when it is there and from the original when it is
 /// not — in which case the result is written to the cache on the way out.
 ///
@@ -133,12 +231,11 @@ pub fn load_preview_cached(
     max_px: u32,
     cache: Option<&DiskCache>,
 ) -> Result<Preview> {
-    let meta = exif_data::read_meta(path);
     let key = cache.and_then(|_| DiskCache::key_for(path));
 
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
         if let Some(bytes) = cache.read(key, Kind::View, max_px) {
-            if let Ok((full_w, full_h)) = upright_dimensions(path) {
+            if let Some((full_w, full_h, meta)) = cached_dims_and_meta(cache, key, path) {
                 if let Ok(rgba) = decode_bytes(&bytes) {
                     let rgba = rgba.into_rgba8();
                     let scale = if full_w > 0 {
@@ -164,6 +261,7 @@ pub fn load_preview_cached(
         if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
             let _ = cache.write(key, Kind::View, max_px, &bytes);
         }
+        let _ = cache.write_meta(key, &encode_meta(preview.full_w, preview.full_h, &preview.meta));
     }
     Ok(preview)
 }
@@ -180,16 +278,31 @@ pub fn load_thumb_cached(
     max_px: u32,
     cache: Option<&DiskCache>,
 ) -> Result<Preview> {
-    let meta = exif_data::read_meta(path);
     let key = cache.and_then(|_| DiskCache::key_for(path));
 
     if let (Some(cache), Some(key)) = (cache, key.as_deref()) {
         if let Some(bytes) = cache.read(key, Kind::Thumb, max_px) {
-            if let Ok(image) = decode_bytes(&bytes) {
-                return Ok(as_preview(image.into_rgba8(), path, meta.clone()));
+            if let Some((full_w, full_h, meta)) = cached_dims_and_meta(cache, key, path) {
+                if let Ok(image) = decode_bytes(&bytes) {
+                    let rgba = image.into_rgba8();
+                    let scale = if full_w > 0 {
+                        rgba.width() as f64 / full_w as f64
+                    } else {
+                        1.0
+                    };
+                    return Ok(Preview {
+                        rgba,
+                        full_w,
+                        full_h,
+                        scale,
+                        meta,
+                    });
+                }
             }
         }
     }
+
+    let meta = exif_data::read_meta(path);
 
     if let Some(embedded) = exif_data::read_exif_thumbnail(path) {
         if let Ok(image) = decode_bytes(&embedded) {
@@ -201,6 +314,7 @@ pub fn load_thumb_cached(
                         if let Ok(bytes) = encode_jpeg(&shrunk, CACHE_QUALITY) {
                             let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
                         }
+                        let _ = cache.write_meta(key, &encode_meta(full_w, full_h, &meta));
                     }
                     let scale = if full_w > 0 {
                         shrunk.width() as f64 / full_w as f64
@@ -225,6 +339,7 @@ pub fn load_thumb_cached(
         if let Ok(bytes) = encode_jpeg(&preview.rgba, CACHE_QUALITY) {
             let _ = cache.write(key, Kind::Thumb, max_px, &bytes);
         }
+        let _ = cache.write_meta(key, &encode_meta(preview.full_w, preview.full_h, &preview.meta));
     }
     Ok(preview)
 }
@@ -237,22 +352,6 @@ fn shapes_agree(thumb_w: u32, thumb_h: u32, full_w: u32, full_h: u32) -> bool {
     let a = thumb_w as f64 / thumb_h as f64;
     let b = full_w as f64 / full_h as f64;
     (a - b).abs() / b < 0.06
-}
-
-fn as_preview(rgba: image::RgbaImage, path: &Path, meta: PhotoMeta) -> Preview {
-    let (full_w, full_h) = upright_dimensions(path).unwrap_or((rgba.width(), rgba.height()));
-    let scale = if full_w > 0 {
-        rgba.width() as f64 / full_w as f64
-    } else {
-        1.0
-    };
-    Preview {
-        rgba,
-        full_w,
-        full_h,
-        scale,
-        meta,
-    }
 }
 
 fn shrink_to(image: DynamicImage, max_px: u32) -> DynamicImage {
@@ -390,5 +489,41 @@ mod tests {
     #[test]
     fn scanning_a_missing_folder_is_an_error_not_a_panic() {
         assert!(scan_folder(Path::new("/nonexistent/folder")).is_err());
+    }
+
+    #[test]
+    fn meta_sidecar_round_trips_with_date_and_gps() {
+        let meta = PhotoMeta {
+            date: Some(crate::datefmt::PhotoDate {
+                year: 2024,
+                month: 7,
+                day: 3,
+                hour: 14,
+                minute: 5,
+            }),
+            gps: Some((51.5, -0.12)),
+            orientation: Orientation::Rotate90,
+        };
+        let bytes = encode_meta(4000, 3000, &meta);
+        let (full_w, full_h, decoded) = decode_meta(&bytes).expect("a freshly encoded sidecar decodes");
+        assert_eq!((full_w, full_h), (4000, 3000));
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn meta_sidecar_round_trips_with_no_date_or_gps() {
+        let meta = PhotoMeta::default();
+        let bytes = encode_meta(1, 1, &meta);
+        let (_, _, decoded) = decode_meta(&bytes).expect("a freshly encoded sidecar decodes");
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn a_truncated_or_wrong_version_sidecar_is_rejected_rather_than_panicking() {
+        assert!(decode_meta(&[]).is_none());
+        assert!(decode_meta(&[META_VERSION]).is_none());
+        let mut bytes = encode_meta(100, 100, &PhotoMeta::default());
+        bytes[0] = META_VERSION.wrapping_add(1);
+        assert!(decode_meta(&bytes).is_none());
     }
 }
