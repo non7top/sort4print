@@ -12,6 +12,14 @@ on:
     types: [opened, synchronize, reopened, edited]
     branches: [main]
 
+# A force-push and a retitle landing close together fire synchronize and
+# edited almost simultaneously — both runs write this PR's forecast comment
+# and RELEASE label, and whichever finishes last wins even if it's the one
+# holding the stale title/diff. One run per PR at a time avoids that.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
