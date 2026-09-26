@@ -3,7 +3,12 @@ resolver = "2"
 members = ["core", "app", "tools/pack-cities", "tools/pack-flags"]
 
 [workspace.package]
-version = "0.1.0"
+# No shared `version` here: release-please's `rust` release-type can't
+# handle `version.workspace = true` in member manifests today (it always
+# tries to patch each member's own `package.version` as a literal string —
+# see googleapis/release-please#2478). Each member below carries its own
+# literal version instead. TODO(non7top/sort4print#36): restore this once
+# googleapis/release-please#2895 (open, unmerged) ships.
 edition = "2021"
 
 [workspace.dependencies]
