@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["release-please"]
+    types: [completed]
+  # Escape hatch to (re)build and publish an already-tagged release without
+  # waiting for a new release-please cycle — e.g. to backfill a release
+  # whose exe failed to upload for a reason unrelated to the tag itself.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to (re)build and publish, e.g. v0.2.0'
+        required: true
+
+jobs:
+  # release-please-action creates its tag/release using the default
+  # GITHUB_TOKEN, and GitHub doesn't trigger downstream workflows for refs
+  # created that way (an anti-recursion guard) — so this can't just trigger
+  # on push: tags like a normal release workflow would; a completed
+  # workflow_run fires regardless of what token the upstream run used.
+  # release-please itself runs on every push to main, not just ones that
+  # cut a release, so check whether this particular run actually did by
+  # looking for a semver tag on its exact commit before building anything.
+  check-release-tag:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.find_tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # workflow_run doesn't check out the commit that triggered it by
+          # default — it checks out the default branch's current tip, which
+          # may have moved on since. Pin to the exact commit release-please
+          # just processed. For a manual backfill (workflow_dispatch),
+          # deliberately do NOT check out the given tag itself — the whole
+          # point of a backfill is to rebuild with whatever release-process
+          # fix just landed on the dispatch ref (normally main), not to
+          # reproduce the original (possibly buggy) build verbatim. `tag`
+          # is only used below to know which existing tag/version this is.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Find a release tag pointing at this commit
+        id: find_tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            # grep exits 1 when no tag matches (the normal case for a non-
+            # release merge) — under this step's `-e -o pipefail` shell,
+            # that would otherwise fail the whole step instead of just
+            # yielding an empty $TAG, which is the expected, already-
+            # handled case (see the `release` job's `if:` below).
+            TAG=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: check-release-tag
+    if: needs.check-release-tag.outputs.tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      # Keyless cosign signing exchanges this job's OIDC token for a
+      # short-lived Fulcio cert — no signing key ever touches the repo.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Same reasoning as check-release-tag's checkout above: build from
+          # the dispatch ref (current code) on a manual backfill, not from
+          # the tag itself, so a release-process fix actually takes effect
+          # instead of reproducing the original build byte-for-byte.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.workflow_run.head_sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p sort4print --locked
+
+      - name: Name the exe after the release tag
+        id: artifact
+        shell: bash
+        run: |
+          NAME="sort4print-${{ needs.check-release-tag.outputs.tag }}.exe"
+          cp target/release/sort4print.exe "target/release/$NAME"
+          echo "path=target/release/$NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      # electron-builder has a built-in GitHub publisher that does this
+      # upload as part of the build (that's what promptloom's `npm run
+      # publish` does); a plain cargo build has no such thing, so this repo
+      # uploads to the release release-please already created explicitly.
+      - name: Upload exe to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.check-release-tag.outputs.tag }}" "${{ steps.artifact.outputs.path }}" --clobber --repo non7top/sort4print
+
+      - uses: sigstore/cosign-installer@v4.1.2
+
+      # Keyless: cosign trades this job's GitHub OIDC token for a
+      # short-lived Fulcio cert and records the signature in the public
+      # Rekor log, so there's no private key to hold or leak. Signs the
+      # exe already uploaded above.
+      - name: Sign release artifact (cosign, keyless)
+        id: cosign_sign
+        shell: bash
+        run: cosign sign-blob --yes --bundle "${{ steps.artifact.outputs.path }}.cosign.bundle" "${{ steps.artifact.outputs.path }}"
+
+      - name: Upload signature bundle to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.check-release-tag.outputs.tag }}" "${{ steps.artifact.outputs.path }}.cosign.bundle" --clobber --repo non7top/sort4print

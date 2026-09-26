@@ -1,0 +1,32 @@
+name: release-please-preview
+
+on:
+  pull_request:
+    # edited fires on a title/body/base-branch change with no new commits.
+    # This repo merges via real merge commits (not squash), so the PR
+    # title itself doesn't feed release-please's changelog/version
+    # computation — but retargeting a PR's base branch onto (or off of)
+    # main does change whether it should be previewed at all, and that's
+    # also delivered as `edited`, not `synchronize`. A real rebase/
+    # force-push already re-triggers via synchronize on its own.
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+# A force-push and a retitle landing close together fire synchronize and
+# edited almost simultaneously — both runs write this PR's forecast comment
+# and RELEASE label, and whichever finishes last wins even if it's the one
+# holding the stale title/diff. One run per PR at a time avoids that.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    uses: non7top/gh-workflows/.github/workflows/release-please-preview.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
