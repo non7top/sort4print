@@ -2,7 +2,7 @@
 name = "pack-cities"
 # TODO(non7top/sort4print#36): back to `version.workspace = true` once
 # googleapis/release-please#2895 ships — see the root Cargo.toml's comment.
-version = "0.5.0"
+version = "0.1.0"
 edition.workspace = true
 publish = false
 
