@@ -1,0 +1,27 @@
+name: pre-commit
+
+# Runs the same .pre-commit-config.yaml the local hook uses, so a
+# contributor without the hook installed gets the same answer, just later.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      # pre-commit run --all-files only runs pre-commit-stage hooks; the
+      # conventional-commit check is commit-msg-stage, so it never fires
+      # here — see conventional-commits.yml for that check.
+      - uses: pre-commit/action@v3.0.1
