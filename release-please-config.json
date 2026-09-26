@@ -1,11 +1,20 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "packages": {
-    ".": {
-      "release-type": "rust",
-      "changelog-path": "CHANGELOG.md",
-      "include-component-in-tag": false,
-      "extra-label": "RELEASE"
+  "include-component-in-tag": false,
+  "extra-label": "RELEASE",
+  "plugins": [
+    { "type": "cargo-workspace", "merge": false },
+    {
+      "type": "linked-versions",
+      "groupName": "sort4print",
+      "components": ["sort4print-core", "sort4print", "pack-cities", "pack-flags"],
+      "merge": true
     }
+  ],
+  "packages": {
+    "core": { "release-type": "rust", "component": "sort4print-core" },
+    "app": { "release-type": "rust", "component": "sort4print" },
+    "tools/pack-cities": { "release-type": "rust", "component": "pack-cities" },
+    "tools/pack-flags": { "release-type": "rust", "component": "pack-flags" }
   }
 }
