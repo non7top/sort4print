@@ -1,0 +1,21 @@
+# Install with:
+#
+#     pre-commit install --hook-type commit-msg
+#
+# commit-msg, not the default pre-commit stage: the only hook below runs at
+# that stage. pre-commit.yml runs this same config in CI, so a contributor
+# without the hook installed still gets caught before merge.
+default_install_hook_types: [commit-msg]
+
+repos:
+  # Conventional commits are load-bearing here, not stylistic: release-please
+  # derives the next version from them, and this repo merges via real merge
+  # commits (not squash), so it's each individual commit message that gets
+  # parsed — a non-conforming one doesn't fail anything, it just quietly
+  # doesn't release, or releases the wrong bump. See conventional-commits.yml
+  # for why CI checks every commit in a PR rather than just its title.
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]

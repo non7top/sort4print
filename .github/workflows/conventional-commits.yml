@@ -1,0 +1,21 @@
+name: Conventional Commits
+
+# This repo merges via real merge commits (not squash), so release-please
+# parses each individual commit that lands on main — not the PR title, and
+# not just the tip commit. Check every commit the PR would bring in, so a
+# non-conforming one is caught before merge instead of silently not
+# releasing (or releasing the wrong bump) afterwards.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-commits:
+    name: Validate Conventional Commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run conventional commits check
+        uses: webiny/action-conventional-commits@v1.3.0
