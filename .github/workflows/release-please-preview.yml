@@ -30,3 +30,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    with:
+      # release-please-config.json has no "." package — it's a pure
+      # virtual cargo-workspace root split into per-member packages
+      # (core, app, tools/pack-cities, tools/pack-flags) linked by the
+      # linked-versions plugin with merge: true. Without this, forecast
+      # falls back to the manifest's first key, which happens to be
+      # right here (every linked package shares one version) but leaves
+      # it guessing rather than told — naming "core" explicitly is what
+      # silences that preflight warning. See non7top/release-please-forecast's
+      # README "Multi-package repositories" section.
+      package-name: core
