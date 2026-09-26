@@ -1,0 +1,29 @@
+name: lint
+
+# actionlint + check-jsonschema against this repo's own workflow files,
+# via the shared reusable workflow in non7top/gh-workflows — that repo is
+# the source of truth for tool versions, not a copy pinned here. Scoped to
+# PRs that actually touch workflow files, since most PRs here don't.
+#
+# Catches same-repo authoring mistakes before merge (bad expressions,
+# malformed YAML, an undeclared input on a *local* reusable-workflow
+# reference). It does not catch an undeclared input on a *remote*
+# reusable-workflow call like release-please-preview.yml's own call into
+# gh-workflows — actionlint can't see across the repo boundary. See
+# non7top/gh-workflows#2.
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/**'
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: non7top/gh-workflows/.github/workflows/actions-lint.yml@main
