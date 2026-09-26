@@ -1,13 +1,13 @@
 name: Conventional Commits
 
 # This repo merges via real merge commits (not squash), so release-please
-# parses each individual commit that lands on main — not the PR title, and
+# parses each individual commit that lands on master — not the PR title, and
 # not just the tip commit. Check every commit the PR would bring in, so a
 # non-conforming one is caught before merge instead of silently not
 # releasing (or releasing the wrong bump) afterwards.
 on:
   pull_request:
-    branches: [main]
+    branches: [master]
 
 permissions:
   contents: read

@@ -19,7 +19,7 @@ jobs:
   # created that way (an anti-recursion guard) — so this can't just trigger
   # on push: tags like a normal release workflow would; a completed
   # workflow_run fires regardless of what token the upstream run used.
-  # release-please itself runs on every push to main, not just ones that
+  # release-please itself runs on every push to master, not just ones that
   # cut a release, so check whether this particular run actually did by
   # looking for a semver tag on its exact commit before building anything.
   check-release-tag:
@@ -36,7 +36,7 @@ jobs:
           # just processed. For a manual backfill (workflow_dispatch),
           # deliberately do NOT check out the given tag itself — the whole
           # point of a backfill is to rebuild with whatever release-process
-          # fix just landed on the dispatch ref (normally main), not to
+          # fix just landed on the dispatch ref (normally master), not to
           # reproduce the original (possibly buggy) build verbatim. `tag`
           # is only used below to know which existing tag/version this is.
           ref: ${{ github.event_name == 'workflow_dispatch' && github.ref || github.event.workflow_run.head_sha }}

@@ -6,11 +6,11 @@ on:
     # This repo merges via real merge commits (not squash), so the PR
     # title itself doesn't feed release-please's changelog/version
     # computation — but retargeting a PR's base branch onto (or off of)
-    # main does change whether it should be previewed at all, and that's
+    # master does change whether it should be previewed at all, and that's
     # also delivered as `edited`, not `synchronize`. A real rebase/
     # force-push already re-triggers via synchronize on its own.
     types: [opened, synchronize, reopened, edited]
-    branches: [main]
+    branches: [master]
 
 # A force-push and a retitle landing close together fire synchronize and
 # edited almost simultaneously — both runs write this PR's forecast comment
