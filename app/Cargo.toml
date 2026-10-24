@@ -23,5 +23,5 @@ eframe = { version = "0.36", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-egui = "0.36"
+egui = "0.37"
 rfd = "0.17"
