@@ -16,7 +16,7 @@ ab_glyph.workspace = true
 # driver and in remote desktop sessions, which is not a machine you can ask a
 # user to stop having. Carrying both costs binary size and buys the program
 # starting at all.
-eframe = { version = "0.36", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
     "default_fonts",
     "glow",
     "wgpu",
